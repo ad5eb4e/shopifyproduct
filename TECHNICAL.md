@@ -369,18 +369,49 @@ GET https://{shop}.myshopify.com/admin/api/2024-10/products.json
 ```
 分页通过响应头 `Link` 中的 `rel="next"` URL 获取下一页。
 
-> 注意：fields 中加入 title，用于检测标题变化。
-
 **获取单个产品完整数据（新产品入库）：**
 ```
 GET https://{shop}.myshopify.com/admin/api/2024-10/products/{id}.json
 ```
+返回包含：title, body_html, product_type, tags, handle, variants, images 等全部字段。
+
+**获取产品 SEO 元字段：**
+```
+GET https://{shop}.myshopify.com/admin/api/2024-10/products/{id}/metafields.json
+    ?namespace=global
+```
+返回 `title_tag`（SEO标题）和 `description_tag`（SEO描述）。
+
+**获取产品所属集合：**
+```
+GET https://{shop}.myshopify.com/admin/api/2024-10/collects.json?product_id={id}
+GET https://{shop}.myshopify.com/admin/api/2024-10/collections/{collection_id}.json
+```
+> 注意：集合名称只做同步展示，暂不支持回写（集合归属关系修改复杂）。
 
 **更新产品（回写）：**
 ```
 PUT https://{shop}.myshopify.com/admin/api/2024-10/products/{id}.json
-Body: {"product": {"id": {id}, "title": "...", "body_html": "..."}}
+Body: {
+  "product": {
+    "id": {id},
+    "title": "...",
+    "body_html": "...",
+    "product_type": "...",
+    "tags": "tag1, tag2, tag3",
+    "handle": "new-handle",
+    "variants": [{"id": {variant_id}, "option1": "..."}],
+    "images": [{"id": {image_id}, "alt": "..."}]
+  }
+}
 ```
+
+**更新 SEO 元字段（回写）：**
+```
+PUT https://{shop}.myshopify.com/admin/api/2024-10/products/{id}/metafields.json
+Body: {"metafield": {"namespace": "global", "key": "title_tag", "value": "...", "type": "single_line_text_field"}}
+```
+SEO标题和SEO描述各需一次 PUT 请求。
 
 **前端 JSON 端点（无需认证，已有产品抓描述）：**
 ```
@@ -447,7 +478,9 @@ lark-cli base +record-list --base-token {base} --table-id {table} --limit 100
     │    GET /admin/api/2024-10/products/{id}.json
     │    │
     │    ▼
-    │    描述字段使用 Admin API 返回的 body_html（首次入库无需额外抓前端）
+    │    从 Admin API 响应提取所有字段（body_html、product_type、tags、handle、images alt、variants option）
+    │    额外调 metafields API 获取 SEO 标题和描述
+    │    额外调 collects API 获取所属集合名称
     │    （注意：product.variants 可能为空数组，product.image 可能为 null，需防御）
     │    │
     │    ▼
@@ -467,8 +500,8 @@ lark-cli base +record-list --base-token {base} --table-id {table} --limit 100
     │         GET https://{storefront}/products/{handle}.json
     │         │
     │         ▼
-    │         对比 title 与多维表中"产品标题"，body_html 与"原始描述HTML"
-    │         ├── 标题或描述有变化 → 更新该记录
+    │         对比所有可扫描字段（title、body_html、product_type、tags、handle、images alt、variants option）
+    │         ├── 任一字段有变化 → 更新该记录
     │         │   lark-cli base +record-batch-update --json '{...}'
     │         │   合规状态重置为 "待检查"
     │         └── 均无变化 → 跳过
@@ -486,16 +519,27 @@ lark-cli base +record-list --base-token {base} --table-id {table} --limit 100
 | Admin API 字段 | 多维表字段 | 备注 |
 |---------------|-----------|------|
 | `product.id` | Shopify产品ID | 大整数，存为文本类型防溢出 |
-| `product.handle` | Handle | |
-| `product.title` | 产品标题 | |
-| `product.product_type` | 产品类型 | |
 | `product.status` | 产品状态 | |
 | `product.variants[0].price` | 价格 | variants 可能为空，需防御 |
 | `product.variants[0].sku` | SKU | 同上 |
 | `product.image.src` | 主图URL | image 可能为 null |
 | 拼接生成 | 前端链接 | |
+
+**风控可扫描字段映射（原始值）：**
+
+| Admin API 字段 | 多维表字段 | 备注 |
+|---------------|-----------|------|
+| `product.title` | 产品标题 | |
 | `product.body_html` | 原始描述HTML | 首次从 Admin API，后续从前端 |
-| html2text(body_html) | 原始描述纯文本 | |
+| html2text(body_html) | 原始描述纯文本 | 辅助阅读 |
+| `product.product_type` | 产品类型 | |
+| `product.tags` | 产品标签 | 逗号分隔字符串 |
+| metafield `global.title_tag` | SEO标题 | 需额外调 metafields API |
+| metafield `global.description_tag` | SEO描述 | 同上 |
+| `product.handle` | Handle | |
+| `product.images[*].alt` | 图片Alt文本 | 所有图片 alt，换行分隔 |
+| `product.variants[*].option1` | 规格名称 | 所有 variant 的 option 值，换行分隔 |
+| collects → collection.title | 所属集合 | 需额外调 collects API，只读不回写 |
 
 ### 8.3 lark-cli 命令（实际可用语法）
 
@@ -602,23 +646,33 @@ writeback()
     │
     ▼
 对每条记录：
-    ├── 检查：改写标题或改写描述至少有一个不为空，否则跳过
-    ├── 从记录中读取：Shopify产品ID、改写标题、改写描述、店铺名称
+    ├── 检查：至少有一个改写字段不为空，否则跳过
+    ├── 从记录中读取：Shopify产品ID、所有改写字段、店铺名称
     ├── 根据店铺名称从 SQLite 获取认证凭证和 proxy
     ├── 获取文件锁 /tmp/shopify_sync_{store_id}.lock
-    ├── 构建回写请求体：
+    ├── 构建回写请求（可能需要多个 API 调用）：
+    │
+    │   ── 产品主体更新（一次 PUT）──
     │   body = {"product": {"id": product_id}}
-    │   如果改写标题不为空 → body["product"]["title"] = 改写标题
-    │   如果改写描述不为空 → body["product"]["body_html"] = 改写描述
-    ├── 通过代理调用 Admin API
+    │   如果改写标题不为空     → body["product"]["title"] = 改写标题
+    │   如果改写描述不为空     → body["product"]["body_html"] = 改写描述
+    │   如果改写产品类型不为空 → body["product"]["product_type"] = 改写产品类型
+    │   如果改写标签不为空     → body["product"]["tags"] = 改写标签
+    │   如果改写Handle不为空   → body["product"]["handle"] = 改写Handle
+    │   如果改写图片Alt不为空  → body["product"]["images"] = [{id, alt}, ...]
+    │   如果改写规格名称不为空 → body["product"]["variants"] = [{id, option1}, ...]
     │   PUT /admin/api/2024-10/products/{id}.json
-    ├── 成功 → 更新多维表（单次 batch-update）：
+    │
+    │   ── SEO 元字段更新（最多两次 PUT）──
+    │   如果改写SEO标题不为空  → PUT metafield global.title_tag
+    │   如果改写SEO描述不为空  → PUT metafield global.description_tag
+    │
+    ├── 全部成功 → 更新多维表（单次 batch-update）：
     │         回写状态 = "已回写"
-    │         如有改写标题 → 产品标题 = 改写标题
-    │         如有改写描述 → 原始描述HTML = 改写描述
-    │                       原始描述纯文本 = html2text(改写描述)
+    │         将每个有值的改写字段同步到对应的原始字段
+    │         （防止下次同步误判为变化）
     │         最后更新时间 = now
-    └── 失败 → 更新多维表：回写状态 = "回写失败"
+    └── 任一失败 → 更新多维表：回写状态 = "回写失败"
               写入 sync_logs（脱敏）
     │
     释放文件锁
@@ -663,34 +717,50 @@ with app.app_context():
 
 默认所有店铺共用一张表，通过"店铺名称"字段区分。如需分表，可为每个店铺配置不同的 table_id。唯一键为"店铺名称 + Shopify产品ID"组合（代码层面去重，多维表不支持唯一约束）。
 
+**基础信息字段：**
+
 | 序号 | 字段名 | 字段类型 | 写入方 | 说明 |
 |-----|-------|---------|-------|------|
 | 1 | 店铺名称 | 单选 | 同步脚本 | 区分店铺来源 |
 | 2 | Shopify产品ID | 文本 | 同步脚本 | 大整数存为文本防溢出 |
-| 3 | Handle | 文本 | 同步脚本 | URL slug，拼前端链接用 |
-| 4 | 产品标题 | 文本 | 同步脚本 | |
-| 5 | 产品类型 | 文本 | 同步脚本 | |
-| 6 | 产品状态 | 单选 | 同步脚本 | active / draft / archived / 已删除 |
-| 7 | 价格 | 数字 | 同步脚本 | 首个 variant 的价格（纯数字） |
-| 8 | SKU | 文本 | 同步脚本 | |
-| 9 | 主图URL | 链接 | 同步脚本 | |
-| 10 | 前端链接 | 链接 | 同步脚本 | `https://{domain}/products/{handle}` |
-| 11 | 原始描述HTML | 文本 | 同步脚本 | 风控扫描的原始内容 |
-| 12 | 原始描述纯文本 | 文本 | 同步脚本 | 去 HTML 标签版本 |
-| 13 | 改写标题 | 文本 | 外部写入 | 合规改写后的产品标题（纯文本） |
-| 14 | 改写描述 | 文本 | 外部写入 | 合规改写后的描述（HTML格式） |
-| 15 | 合规状态 | 单选 | 同步脚本/外部 | 待检查 / 合规 / 已改写 |
-| 16 | 回写状态 | 单选 | 同步脚本 | 未回写 / 已回写 / 回写失败 |
-| 17 | 最后更新时间 | 日期时间 | 同步脚本 | |
+| 3 | 产品状态 | 单选 | 同步脚本 | active / draft / archived / 已删除 |
+| 4 | 价格 | 数字 | 同步脚本 | 首个 variant 的价格 |
+| 5 | SKU | 文本 | 同步脚本 | |
+| 6 | 主图URL | 链接 | 同步脚本 | |
+| 7 | 前端链接 | 链接 | 同步脚本 | `https://{domain}/products/{handle}` |
+
+**风控可扫描字段（原始 + 改写成对）：**
+
+| 序号 | 原始字段 | 改写字段 | 类型 | 说明 |
+|-----|---------|---------|------|------|
+| 8/9 | 产品标题 | 改写标题 | 文本 | |
+| 10/11 | 原始描述HTML | 改写描述 | 文本 | 改写为 HTML 格式 |
+| 12 | 原始描述纯文本 | — | 文本 | 辅助阅读，无需改写 |
+| 13/14 | 产品类型 | 改写产品类型 | 文本 | 如 Supplement → Personal Care |
+| 15/16 | 产品标签 | 改写标签 | 文本 | 逗号分隔 |
+| 17/18 | SEO标题 | 改写SEO标题 | 文本 | |
+| 19/20 | SEO描述 | 改写SEO描述 | 文本 | |
+| 21/22 | Handle | 改写Handle | 文本 | URL slug |
+| 23/24 | 图片Alt文本 | 改写图片Alt | 文本 | 所有图片 alt，换行分隔 |
+| 25/26 | 规格名称 | 改写规格名称 | 文本 | 所有 variant option，换行分隔 |
+| 27 | 所属集合 | — | 文本 | 只读，不支持回写 |
+
+**状态字段：**
+
+| 序号 | 字段名 | 字段类型 | 写入方 | 说明 |
+|-----|-------|---------|-------|------|
+| 28 | 合规状态 | 单选 | 同步脚本/外部 | 待检查 / 合规 / 已改写 |
+| 29 | 回写状态 | 单选 | 同步脚本 | 未回写 / 已回写 / 回写失败 |
+| 30 | 最后更新时间 | 日期时间 | 同步脚本 | |
 
 **状态流转：**
 
 ```
 新产品入库 → 合规状态: 待检查, 回写状态: 未回写
-标题或描述变化 → 合规状态: 待检查（重置）
+任一可扫描字段变化 → 合规状态: 待检查（重置）
 外部改合规 → 合规状态: 合规（无需回写）
-外部改已改写 + 写入改写标题/改写描述 → 合规状态: 已改写 → 触发回写
-回写成功 → 回写状态: 已回写, 产品标题/原始描述HTML 同步更新为改写后的值
+外部改已改写 + 写入改写字段 → 合规状态: 已改写 → 触发回写
+回写成功 → 回写状态: 已回写, 所有有改写值的原始字段同步更新
 回写失败 → 回写状态: 回写失败
 需重新回写 → 手动将回写状态改回"未回写"即可再次触发
 回写24小时后前端描述仍不同 → 解除跳过保护，重新检测变化
@@ -719,7 +789,12 @@ with app.app_context():
   │   (字段4,11,12,16,17)    │                         │
 ```
 
-**改写描述格式要求：** 字段 14 必须为 HTML 格式，回写时直接作为 Shopify 的 `body_html`。字段 13 改写标题为纯文本。
+**改写字段格式要求：**
+- 改写描述：HTML 格式，回写时直接作为 Shopify 的 `body_html`
+- 改写标签：逗号分隔，如 `tag1, tag2, tag3`
+- 图片Alt、规格名称：换行分隔，每行对应一个图片/规格
+- 其他改写字段：纯文本
+- 不需要改写的字段留空即可，系统只回写有内容的改写字段
 
 ## 13. 错误处理
 
