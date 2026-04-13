@@ -4,11 +4,11 @@
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                  单台 VPS                        │
+│              Mac mini（本地部署）                  │
 │                                                  │
 │  ┌──────────────┐     ┌───────────────────────┐ │
 │  │  Web 管理后台 │     │  定时调度器             │ │
-│  │  (Flask)      │     │  (APScheduler)         │ │
+│  │  (gunicorn)   │     │  (APScheduler)         │ │
 │  │  - 店铺配置   │     │  - 按店铺设定频率触发    │ │
 │  │  - 状态查看   │     │  - 通过代理IP访问       │ │
 │  └──────┬───────┘     └──────────┬────────────┘ │
@@ -17,14 +17,14 @@
 │  ┌──────────────┐     ┌───────────────────────┐ │
 │  │  SQLite(WAL) │     │  同步引擎              │ │
 │  │  (店铺配置)   │     │  - Shopify Admin API   │ │
-│  │              │     │  - 前端 JSON 抓取       │ │
+│  │              │     │  - updated_at 变更检测  │ │
 │  └──────────────┘     │  - lark-cli 写多维表    │ │
 │                       │  - 回写 Shopify         │ │
 │                       └───────────┬─────────────┘ │
 │         Nginx (TLS)               │               │
 │         ↕ :443                    │               │
 │  ┌──────────────┐        ┌────────┼────────┐      │
-│  │  Flask :8080 │        ▼        ▼        ▼      │
+│  │ gunicorn:8080│        ▼        ▼        ▼      │
 │  │  (内网监听)   │     代理IP-A  代理IP-B  代理IP-C │
 │  └──────────────┘        │        │        │      │
 └──────────────────────────┼────────┼────────┼──────┘
@@ -37,6 +37,7 @@
 | 组件 | 技术 | 说明 |
 |------|------|------|
 | Web 后台 | Flask + SQLite | 轻量，单文件部署 |
+| WSGI 服务器 | gunicorn (gthread) | `gunicorn -w 1 --threads 4`，**禁止使用 Flask 开发服务器** |
 | 反向代理 | Nginx + Let's Encrypt | TLS 终止，**必须部署** |
 | 前端页面 | 原生 HTML + JS | 不用框架，内联表格编辑 |
 | 定时调度 | APScheduler | 按店铺配置频率运行 |
@@ -44,10 +45,14 @@
 | 数据存储 | SQLite (WAL 模式) | 店铺配置，token 加密存储 |
 | 飞书写入 | lark-cli (subprocess) | 已安装的命令行工具 |
 | Token 加密 | cryptography (Fernet) | 对称加密，密钥从环境变量读取 |
+| 密码哈希 | bcrypt | 管理员密码哈希存储和验证 |
+| HTML 消毒 | bleach | 回写前清理 HTML，防止 XSS |
 | HTML 转文本 | html2text | 去标签保留结构 |
 | 代理支持 | PySocks + requests | SOCKS5 / HTTP 代理 |
 | 限速 | flask-limiter | 防暴力破解 |
 | 安全头 | flask-talisman | CSP、X-Frame-Options 等 |
+| CSRF 保护 | flask-wtf (CSRFProtect) | 所有非 GET 端点强制校验 CSRF token |
+| 进程管理 | launchd (macOS) | 开机自启、崩溃重启、日志管理 |
 
 ## 3. 项目结构
 
@@ -72,7 +77,7 @@ shopifyproduct/
     __init__.py
     shopify_auth.py            # Shopify 认证（Token/OAuth 双模式）
     shopify_admin.py           # Shopify Admin API 封装
-    shopify_storefront.py      # 前端 JSON 抓取
+    shopify_sync.py            # 同步逻辑（变更检测、数据对比）
     lark_writer.py             # lark-cli 命令封装
     models.py                  # 数据结构定义
 
@@ -80,9 +85,14 @@ shopifyproduct/
     run_web.py                 # 启动 Web 后台
     scheduler.py               # 启动定时调度器（内嵌 Flask 进程，单进程架构）
     writeback.py               # 回写 Shopify
+    start.sh                   # launchd 启动入口（加载 .env + 启动 gunicorn）
 
   nginx/
     shopifyproduct.conf        # Nginx 配置模板
+
+  deploy/
+    com.shopifyproduct.plist   # macOS launchd 服务文件
+    .env.example               # 环境变量模板
 
   logs/                        # 运行日志
   data/                        # SQLite 数据库文件（chmod 600）
@@ -94,9 +104,14 @@ shopifyproduct/
 flask
 flask-limiter
 flask-talisman
+flask-wtf
+flask-login
+gunicorn
 requests
 html2text
+bleach
 cryptography
+bcrypt
 apscheduler
 pysocks
 ```
@@ -137,9 +152,11 @@ CREATE TABLE settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
--- 预设: lark_base_token
+-- 预设: lark_base_token（Fernet 加密存储，与 Shopify token 同等对待）
 -- 注意: encrypt_key 不存数据库，从环境变量 FERNET_KEY 读取
 ```
+
+> **安全要求：** `lark_base_token` 授予飞书多维表的完整读写权限，必须使用 Fernet 加密存储，不得明文写入数据库。
 
 ### sync_logs 表
 
@@ -200,11 +217,34 @@ cursor.execute(f"SELECT * FROM stores WHERE store_name = '{name}'")
 
 ```python
 import re
+import socket
+import ipaddress
 
 STORE_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
 SHOP_RE = re.compile(r'^[a-z0-9-]+$')
-PROXY_RE = re.compile(r'^(socks5|http|https)://[a-zA-Z0-9.:]+$')
-PRIVATE_IP_RE = re.compile(r'(^127\.)|(^10\.)|(^172\.(1[6-9]|2\d|3[01])\.)|(^192\.168\.)|(^169\.254\.)')
+PROXY_RE = re.compile(r'^(socks5|https?)://[a-zA-Z0-9._-]+:\d+$')
+STOREFRONT_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$')
+HANDLE_RE = re.compile(r'^[a-z0-9-]+$')
+PRODUCT_ID_RE = re.compile(r'^\d+$')
+
+def _is_private_ip(host: str) -> bool:
+    """检查 IP 或主机名是否解析到私有/保留地址（防 SSRF）"""
+    try:
+        # 尝试直接解析为 IP
+        addr = ipaddress.ip_address(host)
+        return addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local
+    except ValueError:
+        pass
+    # 主机名：DNS 解析后检查
+    try:
+        resolved = socket.getaddrinfo(host, None)
+        for _, _, _, _, sockaddr in resolved:
+            addr = ipaddress.ip_address(sockaddr[0])
+            if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
+                return True
+    except socket.gaierror:
+        return True  # DNS 解析失败，拒绝
+    return False
 
 def validate_store_name(name: str) -> bool:
     return bool(STORE_NAME_RE.match(name)) and len(name) <= 50
@@ -215,26 +255,88 @@ def validate_shop(shop: str) -> bool:
 def validate_proxy(proxy: str) -> bool:
     if not PROXY_RE.match(proxy):
         return False
-    # 提取 IP 部分，禁止私有 IP（防 SSRF）
-    host = proxy.split('://')[1].split(':')[0]
-    return not bool(PRIVATE_IP_RE.match(host))
+    host = proxy.split('://')[1].rsplit(':', 1)[0]
+    return not _is_private_ip(host)
+
+def validate_storefront(domain: str) -> bool:
+    """校验前端域名：合法主机名格式 + 不解析到私有 IP"""
+    if not STOREFRONT_RE.match(domain) or len(domain) > 253:
+        return False
+    # 不允许纯 IP 地址作为 storefront
+    try:
+        ipaddress.ip_address(domain)
+        return False  # 拒绝 IP 地址
+    except ValueError:
+        pass
+    return not _is_private_ip(domain)
+
+def validate_product_id(pid: str) -> bool:
+    """校验 Shopify 产品 ID：纯数字字符串"""
+    return bool(PRODUCT_ID_RE.match(pid)) and len(pid) <= 20
+
+def validate_handle(handle: str) -> bool:
+    """校验 Handle：小写字母、数字、连字符"""
+    return bool(HANDLE_RE.match(handle)) and len(handle) <= 255
+
+def validate_hour(hour) -> bool:
+    """校验扫描频率小时：整数 0-23"""
+    return isinstance(hour, int) and 0 <= hour <= 23
 ```
+
+> **SSRF 防御要点：**
+> - 使用 `ipaddress` 标准库，覆盖 IPv4/IPv6 所有私有、回环、保留、链路本地地址
+> - 主机名先 DNS 解析再检查 IP，防止 DNS 重绑定
+> - `storefront` 字段必须是合法域名，**禁止 IP 地址**
+> - 从飞书读取的 `product_id` 必须校验为纯数字后才可拼入 URL
 
 ### 6.3 认证与安全
 
-**Basic Auth + TLS（强制）：**
-- 用户名和密码通过环境变量 `ADMIN_USER` 和 `ADMIN_PASS` 设置
-- `run_web.py` 启动时检测：若 `ADMIN_PASS` 为 `changeme` 或为空，拒绝启动并报错
-- **必须**在 Flask 前部署 Nginx + Let's Encrypt TLS，Flask 仅监听 `127.0.0.1:8080`
+**Session 登录 + bcrypt + CSRF + TLS（强制）：**
 
-**限速：**
+使用 Flask-Login 实现 session 登录，替代 Basic Auth：
+
+```python
+import bcrypt
+from flask_login import LoginManager, login_required
+from flask_wtf.csrf import CSRFProtect
+
+csrf = CSRFProtect(app)
+login_manager = LoginManager(app)
+
+# 管理员密码以 bcrypt 哈希存储在环境变量中
+# 首次部署生成哈希：python -c "import bcrypt; print(bcrypt.hashpw(b'your_password', bcrypt.gensalt()).decode())"
+ADMIN_USER = os.environ["ADMIN_USER"]
+ADMIN_PASS_HASH = os.environ["ADMIN_PASS_HASH"]  # bcrypt 哈希，非明文
+
+# 启动时检测：哈希不能是 "changeme" 的哈希
+if bcrypt.checkpw(b"changeme", ADMIN_PASS_HASH.encode()):
+    sys.exit("ERROR: 请修改默认密码")
+
+# 登录验证
+def verify_login(username, password):
+    return (username == ADMIN_USER and
+            bcrypt.checkpw(password.encode(), ADMIN_PASS_HASH.encode()))
+```
+
+- Session 超时 30 分钟无操作自动退出
+- 所有非 GET 端点强制 CSRF token 校验（前端通过 `<meta name="csrf-token">` 获取）
+- gunicorn 监听 `0.0.0.0:8080`，局域网内通过 `http://mac-mini-ip:8080` 访问
+- 如需公网访问，**必须**在前面部署 Nginx/Caddy + TLS
+
+**登录限速：**
 ```python
 from flask_limiter import Limiter
 limiter = Limiter(app, default_limits=["60 per minute"])
 
+# 登录端点严格限速：防暴力破解
+@app.route("/login", methods=["POST"])
+@limiter.limit("5 per 15 minutes")
+def login(): ...
+
 # token 明文端点严格限速
 @app.route("/api/stores/<id>/token")
 @limiter.limit("5 per minute")
+@login_required
 def get_token(id): ...
 ```
 
@@ -244,7 +346,7 @@ from flask_talisman import Talisman
 Talisman(app, content_security_policy={"default-src": "'self'"})
 ```
 
-**审计日志：** 每次调用 `/api/stores/<id>/token` 记录到 sync_logs（action="token_view"）。
+**审计日志：** 每次调用 `/api/stores/<id>/token` 记录到 sync_logs（action="token_view"）。登录失败也记录（action="login_failed"）。
 
 ### 6.4 扫描频率前端转 cron
 
@@ -258,10 +360,15 @@ Talisman(app, content_security_policy={"default-src": "'self'"})
 
 前端传 `{"frequency": "daily", "hour": 3}`，后端转为 `0 3 * * *`。每天模式支持 0-23 任意小时。
 
+**后端必须校验 `hour` 为整数且在 0-23 范围内（`validate_hour()`），禁止直接将前端值拼入 cron 字符串。**
+
 ### 6.5 API 路由
 
 ```
-GET    /                    → 管理后台页面
+GET    /                    → 管理后台页面（需登录）
+GET    /login               → 登录页面
+POST   /login               → 登录验证（限速 5次/15分钟）
+GET    /healthz             → 健康检查（无需登录）
 GET    /api/stores          → 获取所有店铺配置（敏感字段星号化）
 POST   /api/stores          → 新增店铺
 PUT    /api/stores/<id>     → 更新店铺配置
@@ -279,7 +386,7 @@ PUT    /api/settings        → 更新全局设置
 - 使用 `cryptography.fernet.Fernet` 对称加密
 - **加密密钥从环境变量 `FERNET_KEY` 读取，不存数据库**
 - 首次部署时生成密钥：`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
-- 以下字段加密存储：`api_token`, `client_secret`, `oauth_token`
+- 以下字段加密存储：`api_token`, `client_secret`, `oauth_token`, `lark_base_token`（settings 表）
 - API 返回店铺列表时，所有敏感字段替换为星号
 - `client_id` 不加密（非敏感）
 - 日志记录前对敏感字段脱敏（过滤 `X-Shopify-Access-Token`、`client_secret` 等）
@@ -413,10 +520,11 @@ Body: {"metafield": {"namespace": "global", "key": "title_tag", "value": "...", 
 ```
 SEO标题和SEO描述各需一次 PUT 请求。
 
-**前端 JSON 端点（无需认证，已有产品抓描述）：**
-```
-GET https://{storefront_domain}/products/{handle}.json
-```
+**~~前端 JSON 端点~~（已废弃，改用 Admin API `updated_at` 检测变更）：**
+
+> ~~`GET https://{storefront_domain}/products/{handle}.json`~~
+>
+> 原方案通过前端 JSON 端点检测变化，但该端点非 Shopify 官方 API，可被主题设置禁用、被 bot 防护拦截，且不包含 SEO metafields。现改为：通过 Admin API 轻量列表的 `updated_at` 字段判断产品是否有更新，有更新时再调 Admin API 获取完整数据。
 
 ### 7.3 速率限制处理
 
@@ -496,15 +604,17 @@ lark-cli base +record-list --base-token {base} --table-id {table} --limit 100
     │    └── 其他 → 继续
     │         │
     │         ▼
-    │         抓前端描述
-    │         GET https://{storefront}/products/{handle}.json
-    │         │
-    │         ▼
-    │         对比所有可扫描字段（title、body_html、product_type、tags、handle、images alt、variants option）
-    │         ├── 任一字段有变化 → 更新该记录
-    │         │   lark-cli base +record-batch-update --json '{...}'
-    │         │   合规状态重置为 "待检查"
-    │         └── 均无变化 → 跳过
+    │         对比 Admin API 轻量列表中的 updated_at 与多维表中的最后更新时间
+    │         ├── updated_at 无变化 → 跳过（产品未修改）
+    │         └── updated_at 有变化 → 调用 Admin API 获取完整数据
+    │              GET /admin/api/2024-10/products/{id}.json
+    │              │
+    │              ▼
+    │              对比所有可扫描字段（title、body_html、product_type、tags、handle、images alt、variants option）
+    │              ├── 任一字段有变化 → 更新该记录
+    │              │   lark-cli base +record-batch-update --json '{...}'
+    │              │   合规状态重置为 "待检查"
+    │              └── 均无变化 → 只更新最后更新时间
     │
     └─── 已删除产品（多维表有，Shopify没有）
          → 更新产品状态为"已删除"，跳过后续处理
@@ -547,6 +657,8 @@ lark-cli base +record-list --base-token {base} --table-id {table} --limit 100
 
 ```bash
 # 读取记录（分页，客户端 jq 过滤）
+# ⚠️ store_name 必须先经过 validate_store_name() 校验（只允许 [a-zA-Z0-9_-]）
+# 再用 json.dumps() 安全转义后拼入 jq 表达式，禁止直接 f-string 插值
 lark-cli base +record-list \
   --base-token {base_token} \
   --table-id {table_id} \
@@ -648,14 +760,16 @@ writeback()
 对每条记录：
     ├── 检查：至少有一个改写字段不为空，否则跳过
     ├── 从记录中读取：Shopify产品ID、所有改写字段、店铺名称
+    ├── **校验 Shopify产品ID 为纯数字（validate_product_id()），不合法则跳过并告警**
+    ├── **校验所有改写字段：长度限制、格式检查（Handle 必须匹配 [a-z0-9-]）**
     ├── 根据店铺名称从 SQLite 获取认证凭证和 proxy
     ├── 获取文件锁 /tmp/shopify_sync_{store_id}.lock
     ├── 构建回写请求（可能需要多个 API 调用）：
     │
     │   ── 产品主体更新（一次 PUT）──
     │   body = {"product": {"id": product_id}}
-    │   如果改写标题不为空     → body["product"]["title"] = 改写标题
-    │   如果改写描述不为空     → body["product"]["body_html"] = 改写描述
+    │   如果改写标题不为空     → body["product"]["title"] = 改写标题（限 255 字符）
+    │   如果改写描述不为空     → body["product"]["body_html"] = bleach.clean(改写描述, tags=ALLOWED_TAGS)
     │   如果改写产品类型不为空 → body["product"]["product_type"] = 改写产品类型
     │   如果改写标签不为空     → body["product"]["tags"] = 改写标签
     │   如果改写Handle不为空   → body["product"]["handle"] = 改写Handle
@@ -706,12 +820,18 @@ with app.app_context():
     scheduler.add_job(writeback, CronTrigger.from_crontab("0 * * * *"), id="writeback")
 
     scheduler.start()
-    app.run(host="127.0.0.1", port=8080)
+    # 由 gunicorn 启动：gunicorn -w 1 --threads 4 -b 0.0.0.0:8080 "scripts.scheduler:create_app()"
+    # 禁止使用 app.run()（Flask 开发服务器不适合生产环境）
+    return app
 ```
 
 **热更新机制：** Web 后台修改店铺配置后，通过 `scheduler.reschedule_job()` 或 `remove_job()` + `add_job()` 直接操作同进程的 scheduler 实例，无需进程间通信。
 
 **并发保护：** 使用文件锁（`fcntl.flock`）按店铺粒度加锁，同一店铺的同步和回写不会并行。文件锁天然支持同进程内多线程场景。
+
+**手动同步防阻塞：** "立即同步"按钮的 API 端点使用 `fcntl.flock(fd, LOCK_EX | LOCK_NB)` 非阻塞锁。如果同步已在进行，立即返回 HTTP 409 Conflict 和"同步进行中，请稍后"提示，避免 HTTP 请求长时间挂起。
+
+**OAuth Token 刷新锁：** `get_oauth_token()` 内部使用独立的文件锁 `/tmp/shopify_oauth_{store_id}.lock`，防止同步和回写同时刷新 token 导致竞态覆盖。
 
 ## 11. 飞书多维表字段设计
 
@@ -790,7 +910,7 @@ with app.app_context():
 ```
 
 **改写字段格式要求：**
-- 改写描述：HTML 格式，回写时直接作为 Shopify 的 `body_html`
+- 改写描述：HTML 格式，回写前经过 `bleach.clean()` 消毒（只允许安全标签：`p, br, strong, em, ul, ol, li, h1-h6, a, img, span, div, table, tr, td, th`），再写入 Shopify 的 `body_html`
 - 改写标签：逗号分隔，如 `tag1, tag2, tag3`
 - 图片Alt、规格名称：换行分隔，每行对应一个图片/规格
 - 其他改写字段：纯文本
@@ -805,7 +925,7 @@ with app.app_context():
 | Shopify API 401（OAuth模式） | 清除 oauth_token 缓存，用 client credentials 重新获取；若仍 401，标记"凭证过期" |
 | 前端 JSON 404 | 产品可能已下架，跳过该产品，不删除多维表记录 |
 | 前端 JSON 超时 | 重试 2 次，仍失败则跳过 |
-| lark-cli 执行失败 | 记录日志（脱敏），终止该店铺同步 |
+| lark-cli 执行失败 | 重试 2 次（间隔 2s → 5s），仍失败则记录日志（脱敏）并终止该店铺同步 |
 | 代理连接失败 | 记录日志，标记该店铺代理异常，跳过 |
 | 单条产品处理异常 | try-except 包裹，记录失败产品 ID，继续处理下一条 |
 | 回写失败 | 更新回写状态为"回写失败"，记录原因到日志（脱敏） |
@@ -813,13 +933,14 @@ with app.app_context():
 | product.image 为 null | 主图URL 填空，不报错 |
 | 重复记录（创建时网络重试） | 创建前检查 ID 映射，已存在则改为 update |
 
-## 14. 部署
+## 14. 部署（macOS / Mac mini）
 
 ### 14.1 环境要求
 
-- 1 台 VPS（2核4G 即可）
-- Python 3.8+
-- Nginx + Let's Encrypt（TLS 必须）
+- Mac mini（本地部署）
+- Python 3.8+（macOS 自带或 Homebrew 安装）
+- 如需外网访问管理后台：Nginx + 自签证书 或 Caddy（自动 TLS）
+- 如仅局域网访问：可直接访问 `http://localhost:8080`，跳过 Nginx
 - lark-cli 已安装并登录（`lark-cli auth login`）
 - 每个店铺一个独立代理 IP
 
@@ -827,54 +948,190 @@ with app.app_context():
 
 ```bash
 # 1. 拉取代码
-git clone <repo-url> /opt/shopifyproduct
-cd /opt/shopifyproduct
+git clone <repo-url> ~/shopifyproduct
+cd ~/shopifyproduct
 
 # 2. 安装依赖
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# 3. 生成加密密钥
-export FERNET_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
-echo "FERNET_KEY=$FERNET_KEY" >> /opt/shopifyproduct/.env  # 持久化
-chmod 600 /opt/shopifyproduct/.env
+# 3. 创建 .env（一次性写入，非追加）
+FERNET_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+ADMIN_PASS_HASH=$(python -c "import bcrypt; print(bcrypt.hashpw(b'你的强密码', bcrypt.gensalt()).decode())")
 
-# 4. 设置后台登录密码
-export ADMIN_USER=admin
-export ADMIN_PASS=<你的强密码>  # 不能是 changeme
+cat > ~/shopifyproduct/.env << EOF
+FERNET_KEY=${FERNET_KEY}
+ADMIN_USER=admin
+ADMIN_PASS_HASH=${ADMIN_PASS_HASH}
+SECRET_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
+EOF
 
-# 5. 设置飞书 Base Token
-export LARK_BASE_TOKEN=<你的base_token>
+chmod 600 ~/shopifyproduct/.env
 
-# 6. 设置数据库目录权限
-mkdir -p /opt/shopifyproduct/data
-chmod 700 /opt/shopifyproduct/data
+# ⚠️ 备份 FERNET_KEY！丢失后所有加密凭证不可恢复
+echo "请将 FERNET_KEY 备份到安全位置：${FERNET_KEY}"
 
-# 7. 配置 Nginx（TLS）
-sudo cp nginx/shopifyproduct.conf /etc/nginx/sites-available/
-sudo ln -s /etc/nginx/sites-available/shopifyproduct.conf /etc/nginx/sites-enabled/
-sudo certbot --nginx -d your-admin-domain.com
-sudo nginx -t && sudo systemctl reload nginx
+# 4. 设置数据库目录权限
+mkdir -p ~/shopifyproduct/data
+chmod 700 ~/shopifyproduct/data
 
-# 8. 启动应用（单进程，包含 Web + 调度器）
-nohup python scripts/scheduler.py > logs/app.log 2>&1 &
+# 5. 部署 launchd 服务（开机自启 + 崩溃自动重启）
+cp deploy/com.shopifyproduct.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.shopifyproduct.plist
+
+# 查看状态
+launchctl list | grep shopifyproduct
+
+# 查看日志
+tail -f ~/shopifyproduct/logs/app.log
+tail -f ~/shopifyproduct/logs/app_error.log
 ```
 
-### 14.3 Nginx 配置模板
+### 14.3 launchd 服务文件（deploy/com.shopifyproduct.plist）
+
+macOS 使用 launchd 替代 systemd，功能等价：开机自启、崩溃重启、日志管理。
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.shopifyproduct</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/adao/shopifyproduct/venv/bin/gunicorn</string>
+        <string>-w</string>
+        <string>1</string>
+        <string>--threads</string>
+        <string>4</string>
+        <string>-b</string>
+        <string>0.0.0.0:8080</string>
+        <string>--timeout</string>
+        <string>120</string>
+        <string>scripts.scheduler:create_app()</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/adao/shopifyproduct</string>
+
+    <!-- 从 .env 文件加载环境变量（launchd 不支持 EnvironmentFile，需逐条列出或用 wrapper） -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/adao/shopifyproduct/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- 开机自启 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 崩溃自动重启，间隔 5 秒 -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- 日志输出 -->
+    <key>StandardOutPath</key>
+    <string>/Users/adao/shopifyproduct/logs/app.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/adao/shopifyproduct/logs/app_error.log</string>
+</dict>
+</plist>
+```
+
+> **注意：** launchd 不支持 `EnvironmentFile`。实际实现中用一个 wrapper 脚本（`scripts/start.sh`）加载 `.env` 后启动 gunicorn：
+
+```bash
+#!/bin/bash
+# scripts/start.sh — launchd 启动入口
+set -a
+source /Users/adao/shopifyproduct/.env
+set +a
+
+cd /Users/adao/shopifyproduct
+exec /Users/adao/shopifyproduct/venv/bin/gunicorn \
+    -w 1 --threads 4 \
+    -b 0.0.0.0:8080 \
+    --timeout 120 \
+    "scripts.scheduler:create_app()"
+```
+
+对应 plist 中 `ProgramArguments` 改为：
+
+```xml
+<key>ProgramArguments</key>
+<array>
+    <string>/bin/bash</string>
+    <string>/Users/adao/shopifyproduct/scripts/start.sh</string>
+</array>
+```
+
+**常用管理命令：**
+
+```bash
+# 启动
+launchctl load ~/Library/LaunchAgents/com.shopifyproduct.plist
+
+# 停止
+launchctl unload ~/Library/LaunchAgents/com.shopifyproduct.plist
+
+# 重启（先停后启）
+launchctl unload ~/Library/LaunchAgents/com.shopifyproduct.plist
+launchctl load ~/Library/LaunchAgents/com.shopifyproduct.plist
+
+# 查看状态（0 = 正常运行，非 0 = 异常）
+launchctl list | grep shopifyproduct
+```
+
+### 14.4 环境变量模板（deploy/.env.example）
+
+```bash
+# 加密密钥（首次部署时生成，丢失不可恢复）
+FERNET_KEY=
+
+# 管理员登录（ADMIN_PASS_HASH 为 bcrypt 哈希，非明文密码）
+ADMIN_USER=admin
+ADMIN_PASS_HASH=
+
+# Flask session 密钥
+SECRET_KEY=
+```
+
+### 14.5 Nginx 配置（可选）
+
+gunicorn 默认绑定 `0.0.0.0:8080`，局域网内通过 `http://mac-mini-ip:8080` 直接访问，无需 Nginx。
+
+如果需要**公网访问**，建议用 Caddy（自动 HTTPS）或 Nginx + 自签证书：
 
 ```nginx
 server {
-    listen 443 ssl;
+    listen 443 ssl http2;
     server_name your-admin-domain.com;
 
-    ssl_certificate /etc/letsencrypt/live/your-admin-domain.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/your-admin-domain.com/privkey.pem;
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+
+    # TLS 加固
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+
+    # 安全头
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    proxy_hide_header X-Powered-By;
 
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
@@ -886,8 +1143,46 @@ server {
 }
 ```
 
-### 14.4 日志
+### 14.6 日志
 
 - 同步日志存入 SQLite `sync_logs` 表，后台面板可查看
 - 所有日志记录前脱敏（过滤 token、secret 等敏感字段）
-- 应用日志输出到 `logs/app.log`
+- 应用日志输出到 `~/shopifyproduct/logs/app.log` 和 `app_error.log`
+- 建议配合 macOS 自带的 `newsyslog` 或定期手动清理日志文件
+
+### 14.7 健康检查
+
+```
+GET /healthz  → 无需登录
+```
+
+检查项：
+- SQLite 可读写
+- APScheduler 正在运行
+- 每个启用店铺的最后同步时间是否超过预设频率的 2 倍
+
+返回 200（健康）或 503（异常）+ JSON 详情。可配合 UptimeRobot 等外部监控。
+
+### 14.8 SQLite 备份
+
+macOS 使用 launchd 定时任务替代 cron：
+
+```bash
+# 简单方案：添加到用户 crontab
+crontab -e
+# 添加以下行（每天凌晨 4 点备份）
+0 4 * * * sqlite3 ~/shopifyproduct/data/stores.db ".backup ~/shopifyproduct/data/stores_backup.db"
+```
+
+> **关键提醒：** `FERNET_KEY` 丢失后所有加密的 API 凭证不可恢复。部署后务必将 FERNET_KEY 备份到独立的安全位置（如密码管理器）。
+
+### 14.9 Shopify API 版本监控
+
+代码启动时检查：如果当前日期距 API 版本（如 `2024-10`）发布已超过 10 个月，在日志中输出 WARNING 提醒升级。
+
+### 14.10 Mac mini 注意事项
+
+- **防休眠：** 系统设置 → 节能 → 勾选"防止自动进入睡眠"，否则休眠后定时任务停止
+- **开机自启：** launchd plist 放在 `~/Library/LaunchAgents/` 下 + `RunAtLoad=true`，用户登录后自动启动
+- **网络稳定性：** Mac mini 建议使用有线网络连接，Wi-Fi 休眠后可能断开
+- **macOS 更新：** 系统更新重启后 launchd 会自动重新加载服务，无需手动操作
