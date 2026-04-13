@@ -1,0 +1,9 @@
+COMPLIANCE_PROMPT.md
+data/
+logs/
+*.db
+*.sqlite
+.env
+__pycache__/
+*.pyc
+venv/
