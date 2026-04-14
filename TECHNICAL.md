@@ -135,7 +135,8 @@ CREATE TABLE stores (
     oauth_token    TEXT,                          -- 加密后的当前 access token（自动获取）
     oauth_expires  TEXT,                          -- token 过期时间 ISO8601
     proxy          TEXT NOT NULL,                 -- 代理地址，只允许 socks5://或http(s)://开头
-    scan_cron      TEXT NOT NULL DEFAULT '0 3 * * *',
+    light_cron     TEXT NOT NULL DEFAULT '0 3 * * *',   -- 轻量扫描频率
+    deep_cron      TEXT NOT NULL DEFAULT '0 4 */3 * *', -- 深度扫描频率（默认每3天）
     table_id       TEXT NOT NULL,
     enabled        INTEGER NOT NULL DEFAULT 1,
     created_at     TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -203,7 +204,8 @@ cursor.execute(f"SELECT * FROM stores WHERE store_name = '{name}'")
 | Client ID | OAuth时必填 | Developer Dashboard 应用 Client ID |
 | Client Secret | OAuth时必填 | 加密存储，页面星号遮蔽 |
 | 代理IP | 是 | 格式 `socks5://ip:port` 或 `http://ip:port` |
-| 扫描频率 | 是 | 可选：每小时 / 每6小时 / 每天 + 具体时间 |
+| 轻量扫描频率 | 是 | 检测新产品+基础字段变化。可选：每小时/每6小时/每天+时间 |
+| 深度扫描频率 | 是 | 逐个产品检测SEO+图片Alt。可选：每天/每2天/每3天/每周+时间 |
 | 飞书 Table ID | 是 | 该店铺对应的多维表 table ID |
 
 前端根据认证方式切换显示：选 Token 时隐藏 Client ID/Secret 输入框，选 OAuth 时隐藏 Access Token 输入框。
@@ -350,7 +352,9 @@ Talisman(app, content_security_policy={"default-src": "'self'"})
 
 ### 6.4 扫描频率前端转 cron
 
-前端提供下拉选择，后端转换为 cron 表达式存入 `scan_cron` 字段：
+前端提供下拉选择，后端转换为 cron 表达式分别存入 `light_cron` 和 `deep_cron` 字段。
+
+**轻量扫描选项（light_cron）：**
 
 | 前端选项 | cron 表达式 |
 |---------|------------|
@@ -358,7 +362,14 @@ Talisman(app, content_security_policy={"default-src": "'self'"})
 | 每6小时 | `0 */6 * * *` |
 | 每天 + 小时(0-23) | `0 {hour} * * *` |
 
-前端传 `{"frequency": "daily", "hour": 3}`，后端转为 `0 3 * * *`。每天模式支持 0-23 任意小时。
+**深度扫描选项（deep_cron）：**
+
+| 前端选项 | cron 表达式 |
+|---------|------------|
+| 每天 + 小时 | `0 {hour} * * *` |
+| 每2天 + 小时 | `0 {hour} */2 * *` |
+| 每3天 + 小时 | `0 {hour} */3 * *` |
+| 每周一 + 小时 | `0 {hour} * * 1` |
 
 **后端必须校验 `hour` 为整数且在 0-23 范围内（`validate_hour()`），禁止直接将前端值拼入 cron 字符串。**
 
@@ -468,33 +479,43 @@ def get_shopify_headers(store):
 
 ### 7.2 接口列表
 
-**获取产品 ID 列表（轻量，用于对比）：**
-```
-GET https://{shop}.myshopify.com/admin/api/2024-10/products.json
-    ?fields=id,handle,updated_at,title
-    &limit=250
-```
-分页通过响应头 `Link` 中的 `rel="next"` URL 获取下一页。
+#### 前端端点（日常同步，无需认证）
 
-**获取单个产品完整数据（新产品入库）：**
+**产品列表（检测新产品）：**
+```
+GET https://{storefront_domain}/products.json?limit=250&page=1
+GET https://{storefront_domain}/products.json?limit=250&page=2
+...
+```
+返回所有已发布产品的 id、handle、title、body_html、product_type、tags、images、variants。分页直到返回空数组。
+
+**单个产品详情（已有产品更新检测）：**
+```
+GET https://{storefront_domain}/products/{handle}.json
+```
+返回完整产品 JSON（不含 SEO metafields）。
+
+**SEO 信息（从前端 HTML 解析）：**
+```
+GET https://{storefront_domain}/products/{handle}
+```
+解析 HTML 提取：
+- `<title>` 标签 → SEO标题
+- `<meta name="description" content="...">` → SEO描述
+
+#### Admin API 端点（新产品入库 + 回写时使用）
+
+**获取单个产品完整数据（新产品入库时需要 status、完整 variants 等前端没有的字段）：**
 ```
 GET https://{shop}.myshopify.com/admin/api/2024-10/products/{id}.json
 ```
-返回包含：title, body_html, product_type, tags, handle, variants, images 等全部字段。
 
-**获取产品 SEO 元字段：**
-```
-GET https://{shop}.myshopify.com/admin/api/2024-10/products/{id}/metafields.json
-    ?namespace=global
-```
-返回 `title_tag`（SEO标题）和 `description_tag`（SEO描述）。
-
-**获取产品所属集合：**
+**获取产品所属集合（只读）：**
 ```
 GET https://{shop}.myshopify.com/admin/api/2024-10/collects.json?product_id={id}
 GET https://{shop}.myshopify.com/admin/api/2024-10/collections/{collection_id}.json
 ```
-> 注意：集合名称只做同步展示，暂不支持回写（集合归属关系修改复杂）。
+> 集合名称只做展示，不支持回写。如需修改需在 Shopify 后台手动操作。
 
 **更新产品（回写）：**
 ```
@@ -520,11 +541,16 @@ Body: {"metafield": {"namespace": "global", "key": "title_tag", "value": "...", 
 ```
 SEO标题和SEO描述各需一次 PUT 请求。
 
-**~~前端 JSON 端点~~（已废弃，改用 Admin API `updated_at` 检测变更）：**
+#### 数据来源总结
 
-> ~~`GET https://{storefront_domain}/products/{handle}.json`~~
->
-> 原方案通过前端 JSON 端点检测变化，但该端点非 Shopify 官方 API，可被主题设置禁用、被 bot 防护拦截，且不包含 SEO metafields。现改为：通过 Admin API 轻量列表的 `updated_at` 字段判断产品是否有更新，有更新时再调 Admin API 获取完整数据。
+| 数据 | 来源 | 需要 Token |
+|------|------|-----------|
+| 产品列表（检测新品） | 前端 `/products.json` | 否 |
+| 产品字段（title、描述、tags等） | 前端 `/products/{handle}.json` | 否 |
+| SEO 标题和描述 | 前端 HTML `<title>` + `<meta>` | 否 |
+| 产品图片 | 前端 `/products/{handle}.json` → images + variants | 否 |
+| 产品状态、所属集合 | Admin API | 是（仅新产品入库时） |
+| 回写（所有字段） | Admin API | 是 |
 
 ### 7.3 速率限制处理
 
@@ -554,70 +580,91 @@ def get_proxies(store):
 
 ### 8.1 同步流程
 
+系统为每个店铺提供**两档扫描频率**，在管理后台分别设置：
+
+| 扫描类型 | 默认频率 | 做什么 | 数据来源 |
+|---------|---------|-------|---------|
+| **轻量扫描** | 每天 1-3 次 | 检测新产品、基础字段变化（标题、描述、标签、类型等） | 前端 `/products.json` |
+| **深度扫描** | 每 2-3 天 1 次 | 逐个产品检测 SEO、图片 Alt、所属集合 | 前端 HTML + Admin API |
+
+轻量扫描不访问单个产品页面，只请求 `/products.json` 列表；深度扫描才会逐个访问 `/products/{handle}` 拿 SEO 信息。
+
+#### 轻量扫描流程
+
 ```
-sync_store(store_id)
+light_sync(store_id)
     │
     ▼
-从 SQLite 读取店铺配置
+获取文件锁
     │
     ▼
-获取文件锁 /tmp/shopify_sync_{store_id}.lock（防止同一店铺并发同步）
-    │
-    ▼
-通过代理调用 Admin API 获取产品列表（含 id, handle, updated_at, title）
-GET /admin/api/2024-10/products.json?fields=id,handle,updated_at,title&limit=250
-（分页拿完所有产品，每店 <1000 个，最多 4 页）
+通过代理请求前端 /products.json（分页拿完所有产品）
+GET https://{storefront}/products.json?limit=250&page=1
+（无需 Token，返回 id、handle、title、body_html、tags、product_type、images、variants）
     │
     ▼
 从飞书多维表读取该店铺的现有记录
-lark-cli base +record-list --base-token {base} --table-id {table} --limit 100
-（客户端 --jq 过滤店铺名称，循环分页拿完）
     │
     ▼
 在内存中构建映射：{shopify_product_id: record_id}
     │
     ▼
-对比：Shopify 产品 ID 列表 vs 多维表已有 ID 列表
+对比产品列表
     │
-    ├─── 新产品（Shopify有，多维表没有）
+    ├─── 新产品（前端有，多维表没有）
     │    │
     │    ▼
-    │    调用 Admin API 获取完整数据
-    │    GET /admin/api/2024-10/products/{id}.json
+    │    从前端 JSON 已有数据提取：title、body_html、tags、product_type、handle、images、variants
+    │    额外调 Admin API 获取 status（前端只有已发布产品）
+    │    额外请求前端 HTML 获取 SEO 标题和描述
+    │    额外调 Admin API collects 获取所属集合
     │    │
     │    ▼
-    │    从 Admin API 响应提取所有字段（body_html、product_type、tags、handle、images alt、variants option）
-    │    额外调 metafields API 获取 SEO 标题和描述
-    │    额外调 collects API 获取所属集合名称
-    │    （注意：product.variants 可能为空数组，product.image 可能为 null，需防御）
-    │    │
-    │    ▼
-    │    写入多维表
-    │    lark-cli base +record-batch-create --json '{...}'
+    │    写入多维表（含产品图片和 Variant 图片）
     │    合规状态 = "待检查"，回写状态 = "未回写"
     │
-    ├─── 已有产品（两边都有）
+    ├─── 已有产品
     │    │
     │    ▼
-    │    检查该记录的"回写状态"
-    │    ├── 回写状态 == "已回写" 且最后更新时间在 24 小时内 → 跳过（刚回写完，等缓存更新）
-    │    └── 其他 → 继续
-    │         │
-    │         ▼
-    │         对比 Admin API 轻量列表中的 updated_at 与多维表中的最后更新时间
-    │         ├── updated_at 无变化 → 跳过（产品未修改）
-    │         └── updated_at 有变化 → 调用 Admin API 获取完整数据
-    │              GET /admin/api/2024-10/products/{id}.json
-    │              │
-    │              ▼
-    │              对比所有可扫描字段（title、body_html、product_type、tags、handle、images alt、variants option）
-    │              ├── 任一字段有变化 → 更新该记录
-    │              │   lark-cli base +record-batch-update --json '{...}'
-    │              │   合规状态重置为 "待检查"
-    │              └── 均无变化 → 只更新最后更新时间
+    │    跳过回写保护期内的记录（回写状态=已回写 且 24小时内）
+    │    │
+    │    ▼
+    │    对比前端 JSON 中的字段与多维表（title、body_html、tags、product_type、images alt、variants option）
+    │    ├── 任一字段有变化 → 更新记录 + 合规状态重置为"待检查"
+    │    └── 均无变化 → 跳过
     │
-    └─── 已删除产品（多维表有，Shopify没有）
-         → 更新产品状态为"已删除"，跳过后续处理
+    └─── 已删除产品（多维表有，前端没有）
+         → 标记产品状态为"已删除"
+
+释放文件锁
+```
+
+#### 深度扫描流程
+
+```
+deep_sync(store_id)
+    │
+    ▼
+获取文件锁
+    │
+    ▼
+从飞书多维表读取该店铺所有记录
+    │
+    ▼
+对每个产品（按 handle 逐个）：
+    │
+    ├── 请求前端 HTML（间隔 1-2 秒）
+    │   GET https://{storefront}/products/{handle}
+    │   解析 <title> 和 <meta name="description">
+    │   │
+    │   ├── SEO 标题或描述有变化 → 更新多维表，合规状态重置
+    │   └── 无变化 → 跳过
+    │
+    ├── 请求前端 JSON（如果轻量扫描间隔内未执行）
+    │   GET https://{storefront}/products/{handle}.json
+    │   检查图片 alt、variant option 变化
+    │
+    └── （可选）调 Admin API collects 检查集合归属变化
 
 释放文件锁
 ```
@@ -632,24 +679,25 @@ lark-cli base +record-list --base-token {base} --table-id {table} --limit 100
 | `product.status` | 产品状态 | |
 | `product.variants[0].price` | 价格 | variants 可能为空，需防御 |
 | `product.variants[0].sku` | SKU | 同上 |
-| `product.image.src` | 主图URL | image 可能为 null |
 | 拼接生成 | 前端链接 | |
+| `product.images[*].src` | 产品图片 | 所有主图 URL，换行分隔 |
+| `product.variants[*].featured_image.src` | Variant图片 | 每行：`option1 \| URL`，无图则跳过 |
 
 **风控可扫描字段映射（原始值）：**
 
 | Admin API 字段 | 多维表字段 | 备注 |
 |---------------|-----------|------|
 | `product.title` | 产品标题 | |
-| `product.body_html` | 原始描述HTML | 首次从 Admin API，后续从前端 |
+| `product.body_html` | 原始描述HTML | 从 `/products.json` 或 `/products/{handle}.json` |
 | html2text(body_html) | 原始描述纯文本 | 辅助阅读 |
-| `product.product_type` | 产品类型 | |
-| `product.tags` | 产品标签 | 逗号分隔字符串 |
-| metafield `global.title_tag` | SEO标题 | 需额外调 metafields API |
-| metafield `global.description_tag` | SEO描述 | 同上 |
-| `product.handle` | Handle | |
+| `product.product_type` | 产品类型 | 从 `/products.json` |
+| `product.tags` | 产品标签 | 逗号分隔字符串，从 `/products.json` |
+| HTML `<title>` | SEO标题 | 从前端 HTML `GET /products/{handle}` 解析 `<title>` 标签 |
+| HTML `<meta name="description">` | SEO描述 | 从前端 HTML 解析 meta description |
+| `product.handle` | Handle | 从 `/products.json` |
 | `product.images[*].alt` | 图片Alt文本 | 所有图片 alt，换行分隔 |
 | `product.variants[*].option1` | 规格名称 | 所有 variant 的 option 值，换行分隔 |
-| collects → collection.title | 所属集合 | 需额外调 collects API，只读不回写 |
+| collects → collection.title | 所属集合 | 需 Admin API collects 端点，只读展示不回写 |
 
 ### 8.3 lark-cli 命令（实际可用语法）
 
@@ -809,11 +857,19 @@ scheduler = BackgroundScheduler()
 with app.app_context():
     # 加载店铺配置，创建同步任务
     for store in get_enabled_stores():
+        # 轻量扫描（检测新产品+基础字段）
         scheduler.add_job(
-            sync_store,
-            CronTrigger.from_crontab(store.scan_cron),
+            light_sync,
+            CronTrigger.from_crontab(store.light_cron),
             args=[store.id],
-            id=f"sync_{store.id}"
+            id=f"light_{store.id}"
+        )
+        # 深度扫描（SEO + 图片Alt + 集合）
+        scheduler.add_job(
+            deep_sync,
+            CronTrigger.from_crontab(store.deep_cron),
+            args=[store.id],
+            id=f"deep_{store.id}"
         )
 
     # 全局回写任务
@@ -846,32 +902,33 @@ with app.app_context():
 | 3 | 产品状态 | 单选 | 同步脚本 | active / draft / archived / 已删除 |
 | 4 | 价格 | 数字 | 同步脚本 | 首个 variant 的价格 |
 | 5 | SKU | 文本 | 同步脚本 | |
-| 6 | 主图URL | 链接 | 同步脚本 | |
-| 7 | 前端链接 | 链接 | 同步脚本 | `https://{domain}/products/{handle}` |
+| 6 | 前端链接 | 链接 | 同步脚本 | `https://{domain}/products/{handle}` |
+| 7 | 产品图片 | 文本 | 同步脚本 | 所有主图 URL，换行分隔 |
+| 8 | Variant图片 | 文本 | 同步脚本 | 每行：`规格名 \| 图片URL` |
 
 **风控可扫描字段（原始 + 改写成对）：**
 
 | 序号 | 原始字段 | 改写字段 | 类型 | 说明 |
 |-----|---------|---------|------|------|
-| 8/9 | 产品标题 | 改写标题 | 文本 | |
-| 10/11 | 原始描述HTML | 改写描述 | 文本 | 改写为 HTML 格式 |
-| 12 | 原始描述纯文本 | — | 文本 | 辅助阅读，无需改写 |
-| 13/14 | 产品类型 | 改写产品类型 | 文本 | 如 Supplement → Personal Care |
-| 15/16 | 产品标签 | 改写标签 | 文本 | 逗号分隔 |
-| 17/18 | SEO标题 | 改写SEO标题 | 文本 | |
-| 19/20 | SEO描述 | 改写SEO描述 | 文本 | |
-| 21/22 | Handle | 改写Handle | 文本 | URL slug |
-| 23/24 | 图片Alt文本 | 改写图片Alt | 文本 | 所有图片 alt，换行分隔 |
-| 25/26 | 规格名称 | 改写规格名称 | 文本 | 所有 variant option，换行分隔 |
-| 27 | 所属集合 | — | 文本 | 只读，不支持回写 |
+| 9/10 | 产品标题 | 改写标题 | 文本 | |
+| 11/12 | 原始描述HTML | 改写描述 | 文本 | 改写为 HTML 格式 |
+| 13 | 原始描述纯文本 | — | 文本 | 辅助阅读，无需改写 |
+| 14/15 | 产品类型 | 改写产品类型 | 文本 | 如 Supplement → Personal Care |
+| 16/17 | 产品标签 | 改写标签 | 文本 | 逗号分隔 |
+| 18/19 | SEO标题 | 改写SEO标题 | 文本 | 从前端 HTML meta 标签提取 |
+| 20/21 | SEO描述 | 改写SEO描述 | 文本 | 同上 |
+| 22/23 | Handle | 改写Handle | 文本 | URL slug |
+| 24/25 | 图片Alt文本 | 改写图片Alt | 文本 | 所有图片 alt，换行分隔 |
+| 26/27 | 规格名称 | 改写规格名称 | 文本 | 所有 variant option，换行分隔 |
+| 28 | 所属集合 | — | 文本 | 只读展示，需在 Shopify 后台手动修改 |
 
 **状态字段：**
 
 | 序号 | 字段名 | 字段类型 | 写入方 | 说明 |
 |-----|-------|---------|-------|------|
-| 28 | 合规状态 | 单选 | 同步脚本/外部 | 待检查 / 合规 / 已改写 |
-| 29 | 回写状态 | 单选 | 同步脚本 | 未回写 / 已回写 / 回写失败 |
-| 30 | 最后更新时间 | 日期时间 | 同步脚本 | |
+| 29 | 合规状态 | 单选 | 同步脚本/外部 | 待检查 / 合规 / 已改写 |
+| 30 | 回写状态 | 单选 | 同步脚本 | 未回写 / 已回写 / 回写失败 |
+| 31 | 最后更新时间 | 日期时间 | 同步脚本 | |
 
 **状态流转：**
 
