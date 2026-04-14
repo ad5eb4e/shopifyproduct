@@ -135,8 +135,10 @@ CREATE TABLE stores (
     oauth_token    TEXT,                          -- 加密后的当前 access token（自动获取）
     oauth_expires  TEXT,                          -- token 过期时间 ISO8601
     proxy          TEXT NOT NULL,                 -- 代理地址，只允许 socks5://或http(s)://开头
-    light_cron     TEXT NOT NULL DEFAULT '0 3 * * *',   -- 轻量扫描频率
-    deep_cron      TEXT NOT NULL DEFAULT '0 4 */3 * *', -- 深度扫描频率（默认每3天）
+    light_cron     TEXT NOT NULL DEFAULT '0 3 * * *',   -- 轻量扫描 cron
+    deep_cycle     INTEGER NOT NULL DEFAULT 3,          -- 深度扫描周期（天），如 3 = 3天扫完所有产品
+    deep_hour      INTEGER NOT NULL DEFAULT 4,          -- 深度扫描每天执行时间（小时，0-23）
+    deep_offset    INTEGER NOT NULL DEFAULT 0,          -- 当前深度扫描偏移量（内部使用，自动更新）
     table_id       TEXT NOT NULL,
     enabled        INTEGER NOT NULL DEFAULT 1,
     created_at     TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -205,7 +207,8 @@ cursor.execute(f"SELECT * FROM stores WHERE store_name = '{name}'")
 | Client Secret | OAuth时必填 | 加密存储，页面星号遮蔽 |
 | 代理IP | 是 | 格式 `socks5://ip:port` 或 `http://ip:port` |
 | 轻量扫描频率 | 是 | 检测新产品+基础字段变化。可选：每小时/每6小时/每天+时间 |
-| 深度扫描频率 | 是 | 逐个产品检测SEO+图片Alt。可选：每天/每2天/每3天/每周+时间 |
+| 深度扫描周期 | 是 | 几天内循环扫完所有产品。可选：1/2/3/5/7 天 |
+| 深度扫描时间 | 是 | 每天执行深度批次的小时，0-23 |
 | 飞书 Table ID | 是 | 该店铺对应的多维表 table ID |
 
 前端根据认证方式切换显示：选 Token 时隐藏 Client ID/Secret 输入框，选 OAuth 时隐藏 Access Token 输入框。
@@ -362,16 +365,11 @@ Talisman(app, content_security_policy={"default-src": "'self'"})
 | 每6小时 | `0 */6 * * *` |
 | 每天 + 小时(0-23) | `0 {hour} * * *` |
 
-**深度扫描选项（deep_cron）：**
+**深度扫描：** 不使用 cron 表达式，而是存 `deep_cycle`（周期天数）和 `deep_hour`（每天执行小时）。调度器每天在 `deep_hour` 时触发一次 `deep_sync()`，函数内部根据 `deep_cycle` 计算当天要扫的产品范围。
 
-| 前端选项 | cron 表达式 |
-|---------|------------|
-| 每天 + 小时 | `0 {hour} * * *` |
-| 每2天 + 小时 | `0 {hour} */2 * *` |
-| 每3天 + 小时 | `0 {hour} */3 * *` |
-| 每周一 + 小时 | `0 {hour} * * 1` |
+前端传 `{"deep_cycle": 3, "deep_hour": 4}`，后端直接存入数据库。
 
-**后端必须校验 `hour` 为整数且在 0-23 范围内（`validate_hour()`），禁止直接将前端值拼入 cron 字符串。**
+**后端必须校验：`deep_cycle` 为 1-7 的整数，`deep_hour` 为 0-23 的整数。**
 
 ### 6.5 API 路由
 
@@ -639,7 +637,7 @@ GET https://{storefront}/products.json?limit=250&page=1
 释放文件锁
 ```
 
-#### 深度扫描流程
+#### 深度扫描流程（分批循环）
 
 ```
 deep_sync(store_id)
@@ -648,26 +646,49 @@ deep_sync(store_id)
 获取文件锁
     │
     ▼
-从飞书多维表读取该店铺所有记录
+从飞书多维表读取该店铺所有产品记录（按 Shopify产品ID 排序）
+total = 总产品数
+batch_size = ceil(total / store.deep_cycle)  # 如 1000 产品 / 3 天 = 每天 334 个
+offset = store.deep_offset  # 上次扫到哪里了
     │
     ▼
-对每个产品（按 handle 逐个）：
+判断是否首次（deep_offset == 0 且多维表中无深度扫描记录）
+    ├── 首次 → 全量扫描所有产品（不分批）
+    └── 非首次 → 取本批次产品：products[offset : offset + batch_size]
     │
-    ├── 请求前端 HTML（间隔 1-2 秒）
+    ▼
+对本批次每个产品（按 handle 逐个，间隔 1-2 秒）：
+    │
+    ├── 请求前端 HTML
     │   GET https://{storefront}/products/{handle}
-    │   解析 <title> 和 <meta name="description">
+    │   解析 <title> → SEO标题
+    │   解析 <meta name="description"> → SEO描述
     │   │
-    │   ├── SEO 标题或描述有变化 → 更新多维表，合规状态重置
+    │   ├── SEO 字段有变化 → 更新多维表，合规状态重置为"待检查"
     │   └── 无变化 → 跳过
     │
-    ├── 请求前端 JSON（如果轻量扫描间隔内未执行）
+    ├── 请求前端 JSON
     │   GET https://{storefront}/products/{handle}.json
     │   检查图片 alt、variant option 变化
+    │   更新产品图片和 Variant 图片字段
     │
-    └── （可选）调 Admin API collects 检查集合归属变化
-
+    └── （新产品入库时已拉过集合，后续不再重复拉）
+    │
+    ▼
+更新 deep_offset：
+    new_offset = offset + batch_size
+    如果 new_offset >= total → 重置为 0（一轮扫完，下轮从头开始）
+    否则 → 保存 new_offset
+    │
+    ▼
 释放文件锁
 ```
+
+**示例：1000 个产品，deep_cycle = 3**
+- 第 1 天：扫 #1 - #334，deep_offset 更新为 334
+- 第 2 天：扫 #335 - #667，deep_offset 更新为 667
+- 第 3 天：扫 #668 - #1000，deep_offset 重置为 0
+- 第 4 天：从头开始，扫 #1 - #334
 
 ### 8.2 数据映射
 
@@ -864,10 +885,10 @@ with app.app_context():
             args=[store.id],
             id=f"light_{store.id}"
         )
-        # 深度扫描（SEO + 图片Alt + 集合）
+        # 深度扫描（SEO + 图片Alt，每天执行一批）
         scheduler.add_job(
             deep_sync,
-            CronTrigger.from_crontab(store.deep_cron),
+            CronTrigger(hour=store.deep_hour, minute=0),
             args=[store.id],
             id=f"deep_{store.id}"
         )
