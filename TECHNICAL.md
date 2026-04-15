@@ -111,7 +111,7 @@ shopifyproduct/
       checker.py               # 9 字段风控检测 + 所属集合告警
       rewriter.py
 
-    writeback/                 # 合规回写（飞书 → Shopify，需运营确认）
+    writeback/                 # 合规回写（飞书 → Shopify，自动执行）
       __init__.py
       writer.py
 
@@ -224,7 +224,7 @@ class ComplianceApp(BaseApp):
 ```python
 class WritebackApp(BaseApp):
     app_name = "writeback"
-    description = "合规回写（飞书 → Shopify，需运营确认）"
+    description = "合规回写（飞书 → Shopify，自动执行）"
     config_schema = {"writeback_cron": "0 * * * *"}
 
     def validate_config(self, config):
@@ -667,7 +667,7 @@ compliance_check(store_id)
 ```
 writeback(store_id)
   → 获取 store 级文件锁
-  → lark.query(dsl={合规状态=="已改写" AND 回写状态=="待回写" AND 产品状态≠"已删除"})
+  → lark.query(dsl={合规状态=="已改写" AND 回写状态≠"已回写" AND 产品状态≠"已删除"})
   → 对每条记录：
       validate_product_id() + 校验改写字段长度/格式
       bleach.clean(改写描述) — HTML 消毒
@@ -678,7 +678,7 @@ writeback(store_id)
   → 释放锁
 ```
 
-**人工审批卡点：** writeback 只处理 `回写状态=="待回写"` 的记录。compliance 写入改写后，回写状态为"未回写"。**运营必须在飞书中手动将回写状态改为"待回写"**，回写才会执行。
+**全自动执行：** compliance 设置 `合规状态="已改写"` 后，writeback 下次运行时自动回写，无需人工干预。如需重新回写（如修改了改写内容），将"回写状态"改回"未回写"即可。
 
 ### 6.4 应用依赖关系
 
@@ -711,8 +711,8 @@ writeback(store_id)
 | `product.tags` | 产品标签 |
 | `product.handle` | Handle |
 | `product.status` | 产品状态 |
-| `product.variants[0].price` | 价格（首个 variant） |
-| `product.variants[0].sku` | SKU（首个 variant） |
+| `product.variants[*].price` | 价格（每行：`option1 \| price`） |
+| `product.variants[*].sku` | SKU（每行：`option1 \| sku`） |
 | `product.images[*].src` | 产品图片 |
 | `product.images[*].alt` | 图片Alt文本 |
 | `product.variants[*].featured_image.src` | Variant图片 |
@@ -728,8 +728,8 @@ writeback(store_id)
 | 1 | 店铺名称 | 单选 | sync |
 | 2 | Shopify产品ID | 文本 | sync |
 | 3 | 产品状态 | 单选 | sync（含"已删除"） |
-| 4 | 价格 | 数字 | sync |
-| 5 | SKU | 文本 | sync |
+| 4 | 价格 | 文本 | sync（每行：`规格名 \| 价格`） |
+| 5 | SKU | 文本 | sync（每行：`规格名 \| SKU`） |
 | 6 | 前端链接 | 链接 | sync |
 | 7 | 产品图片 | 文本 | sync |
 | 8 | Variant图片 | 文本 | sync |
@@ -745,10 +745,10 @@ writeback(store_id)
 | 26/27 | 规格名称 / 改写规格名称 | 文本 | sync / compliance |
 | 28 | 所属集合 | 文本 | sync（只读，风险时日志告警） |
 | 29 | 合规状态 | 单选 | sync / compliance / writeback |
-| 30 | 回写状态 | 单选 | 运营手动 / writeback |
+| 30 | 回写状态 | 单选 | writeback |
 | 31 | 最后更新时间 | 日期时间 | 各应用 |
 
-**回写状态四态：** 未回写 → 待回写（运营手动）→ 已回写 / 回写失败
+**回写状态三态：** 未回写 → 已回写 / 回写失败（如需重新回写，改回"未回写"即可）
 
 ---
 
