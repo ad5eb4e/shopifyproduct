@@ -346,7 +346,7 @@ def get_oauth_token(store):
 
 401 处理：OAuth 收到 401 → 清缓存重新获取 → 仍 401 → 标记"凭证过期"。
 
-**OAuth 刷新锁：** 使用独立文件锁 `/tmp/shopify_oauth_{store_id}.lock`（per-store 粒度），防止同步和回写同时刷新竞态。
+**OAuth 刷新锁：** 使用独立文件锁 `data/locks/oauth_{store_id}.lock`（per-store 粒度），防止同步和回写同时刷新竞态。
 
 ### 5.4 数据库设计（SQLite WAL + busy_timeout）
 
@@ -530,7 +530,7 @@ class TaskScheduler:
 
 **热更新流程：** `PUT /api/stores/<id>/apps/<app>` → `validate_config()` → 保存 → `app.on_config_changed()` → unregister + register → **立即生效**。
 
-**并发保护：** 文件锁 `fcntl.flock`，锁粒度为 **store_id 级别**（`/tmp/shopify_store_{store_id}.lock`），**所有应用共享同一把锁**，防止不同应用同时写同一行飞书记录。手动触发用 `LOCK_NB`。
+**并发保护：** 文件锁 `fcntl.flock`，锁粒度为 **store_id 级别**（`data/locks/store_{store_id}.lock`），**所有应用共享同一把锁**，防止不同应用同时写同一行飞书记录。手动触发用 `LOCK_NB`。锁文件放在项目 `data/locks/` 目录下（`chmod 700`），不使用 `/tmp`（防止其他进程抢占）。
 
 ### 5.7 Web 管理后台
 
@@ -547,18 +547,18 @@ GET    /api/stores                  → 所有店铺（限速 30次/分钟）
 POST   /api/stores                  → 新增店铺（限速 10次/分钟）
 PUT    /api/stores/<id>             → 更新店铺（限速 10次/分钟）
 DELETE /api/stores/<id>             → 删除店铺（限速 5次/分钟）
-POST   /api/stores/<id>/test       → 测试连接
-GET    /api/stores/<id>/token      → 明文 token（限速 5次/分钟，需二次密码确认）
+POST   /api/stores/<id>/test       → 测试连接（限速 5次/分钟）
+POST   /api/stores/<id>/token      → 明文 token（限速 5次/分钟，需二次密码确认，POST 提交密码）
 GET    /api/stores/<id>/logs       → 日志（可按 app_name 筛选）
-GET    /api/settings                → 全局设置
-PUT    /api/settings                → 更新全局设置
+GET    /api/settings                → 全局设置（限速 30次/分钟）
+PUT    /api/settings                → 更新全局设置（限速 3次/分钟，需二次密码确认）
 
 ── 应用配置路由 ──
 GET    /api/apps                    → 已发现的所有应用列表
 GET    /api/stores/<id>/apps        → 该店铺已启用的应用及配置
-PUT    /api/stores/<id>/apps/<app>  → 更新应用配置（校验后热更新调度）
+PUT    /api/stores/<id>/apps/<app>  → 更新应用配置（限速 10次/分钟，校验后热更新调度）
 
-── 应用专属路由 ──
+── 应用专属路由（手动触发，限速 3次/分钟/店铺） ──
 POST   /api/stores/<id>/sync       → [sync] 手动触发同步
 POST   /api/stores/<id>/check      → [compliance] 手动触发检查
 POST   /api/stores/<id>/writeback  → [writeback] 手动触发回写
@@ -570,8 +570,9 @@ POST   /api/stores/<id>/writeback  → [writeback] 手动触发回写
 - Session 登录 + bcrypt + CSRF + flask-talisman
 - 超时 30 分钟
 - 登录限速 5次/15分钟
-- **Token 查看需二次密码确认**（POST 密码 → 返回 token，非直接 GET）
-- **所有 CRUD 端点均有限速**
+- **Token 查看需二次密码确认**（POST 提交密码 → 返回 token）
+- **全局设置修改需二次密码确认**（防止 table_id / lark_base_token 被篡改）
+- **所有端点均有限速**（CRUD、手动触发、设置修改）
 - 凭证 Fernet 加密，密钥从 `FERNET_KEY` 环境变量读取
 - `/healthz` 未认证时只返回 `{"status":"ok"}`，认证后返回详细信息（调度器状态、各应用最后运行时间、代理连通性）
 - **CORS 锁死**：无 `Access-Control-Allow-Origin` 头
@@ -592,7 +593,7 @@ POST   /api/stores/<id>/writeback  → [writeback] 手动触发回写
 
 #### API Version
 
-默认 `2024-10`，存为 settings 表中的全局配置项（可在管理后台修改，无需改代码）。启动时检查距发布超过 10 个月则 WARNING。
+默认 `2025-04`，存为 settings 表中的全局配置项（可在管理后台修改，无需改代码）。启动时检查距发布超过 10 个月则 WARNING。
 
 #### 限速
 
@@ -669,8 +670,10 @@ writeback(store_id)
   → 获取 store 级文件锁
   → lark.query(dsl={合规状态=="已改写" AND 回写状态≠"已回写" AND 产品状态≠"已删除"})
   → 对每条记录：
-      validate_product_id() + 校验改写字段长度/格式
-      bleach.clean(改写描述) — HTML 消毒
+      validate_product_id()
+      所有改写字段：长度限制 + 格式校验（Handle 须 [a-z0-9-]，标签须逗号分隔等）
+      改写描述 → bleach.clean(ALLOWED_TAGS) — HTML 消毒
+      改写标题/类型/标签/SEO/Handle/Alt/规格 → 纯文本，strip HTML 标签 + 长度截断
       client.update_product(id, data)
       client.update_product_seo(id, title, desc)
       成功 → batch_update(回写状态="已回写", 合规状态="合规", 原始字段同步更新)
@@ -831,6 +834,7 @@ server {
     add_header Strict-Transport-Security "max-age=63072000" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "DENY" always;
+    add_header Content-Security-Policy "default-src 'self'" always;
     proxy_hide_header X-Powered-By;
 
     # 不设置 Access-Control-Allow-Origin
