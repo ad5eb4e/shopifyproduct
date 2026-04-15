@@ -2,51 +2,46 @@
 
 ## 1. 系统架构
 
-系统分为两层：**中台核心层**（店铺管理 + Shopify API 抽象）和**业务应用层**（同步、回写等具体任务）。
+系统分为**中台核心层**和**业务应用层**。应用之间不互相调用，只通过飞书多维表的字段状态协作。
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Mac mini（本地部署）                        │
-│                                                              │
-│  ┌─────────────────── 业务应用层 ──────────────────────────┐ │
-│  │                                                          │ │
-│  │  ┌────────────┐  ┌────────────┐  ┌────────────────────┐ │ │
-│  │  │ 产品同步    │  │ 合规回写    │  │ 未来应用            │ │ │
-│  │  │ light_sync │  │ writeback  │  │ product_copy       │ │ │
-│  │  │ deep_sync  │  │            │  │ report_export      │ │ │
-│  │  └─────┬──────┘  └─────┬──────┘  └────────┬───────────┘ │ │
-│  │        │               │                   │             │ │
-│  │        │    ┌───────────┴──────┐            │             │ │
-│  │        │    │  lark_writer     │            │             │ │
-│  │        │    │  (飞书多维表读写) │            │             │ │
-│  │        │    └──────────────────┘            │             │ │
-│  └────────┼───────────────────────────────────┼─────────────┘ │
-│           ▼                                   ▼               │
-│  ┌─────────────────── 中台核心层 ──────────────────────────┐  │
-│  │                                                          │  │
-│  │  ┌──────────────┐     ┌───────────────────────────────┐ │  │
-│  │  │  Web 管理后台 │     │  shopify_client               │ │  │
-│  │  │  (gunicorn)   │     │  ● get_client(store) → Client │ │  │
-│  │  │  - 店铺 CRUD  │     │  ● 自动认证（Token/OAuth）     │ │  │
-│  │  │  - 状态查看   │     │  ● 自动代理路由                │ │  │
-│  │  └──────┬───────┘     │  ● 限速 + 重试                │ │  │
-│  │         │              └──────────────┬────────────────┘ │  │
-│  │         ▼                             │                   │  │
-│  │  ┌──────────────┐     ┌───────────────┴───────────────┐  │  │
-│  │  │  SQLite(WAL) │     │  定时调度器 (APScheduler)      │  │  │
-│  │  │  - stores    │     │  - 按店铺/应用配置触发          │  │  │
-│  │  │  - settings  │     │  - 注册/注销任务               │  │  │
-│  │  │  - sync_logs │     └───────────────────────────────┘  │  │
-│  │  └──────────────┘                                         │  │
-│  └───────────────────────────────────────────────────────────┘  │
+┌─────────────────────────────────────────────────────────────────┐
+│                      Mac mini（本地部署）                          │
 │                                                                  │
-│         ┌────────────────────────────────────────┐               │
-│         │          代理路由（每店独立）             │               │
-│         │    代理IP-A    代理IP-B    代理IP-C      │               │
-│         └────────┬──────────┬──────────┬─────────┘               │
-└──────────────────┼──────────┼──────────┼─────────────────────────┘
-                   ▼          ▼          ▼
-              Shopify-A  Shopify-B  Shopify-C
+│  ┌──────────────────── 业务应用层 ─────────────────────────────┐ │
+│  │                                                              │ │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │ │
+│  │  │ sync     │  │compliance│  │writeback │  │ 未来应用    │  │ │
+│  │  │ Shopify→ │  │ 飞书→    │  │ 飞书→    │  │            │  │ │
+│  │  │ 飞书     │  │ 检查→飞书│  │ Shopify  │  │            │  │ │
+│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │ │
+│  │       │             │             │               │         │ │
+│  │  ─ ─ ─│─ ─ ─ ─ ─ ─ │─ ─ 飞书多维表 ─ ─ ─ ─ ─ ─ ─│─ ─ ─   │ │
+│  │       │             │             │               │         │ │
+│  └───────┼─────────────┼─────────────┼───────────────┼─────────┘ │
+│          ▼             ▼             ▼               ▼           │
+│  ┌──────────────────── 中台核心层 ──────────────────────────────┐ │
+│  │                                                              │ │
+│  │  ┌──────────────┐  ┌───────────────┐  ┌───────────────────┐ │ │
+│  │  │ Web 管理后台  │  │ ShopifyClient │  │ LarkClient        │ │ │
+│  │  │ (gunicorn)    │  │ ● 认证        │  │ ● lark-cli 封装   │ │ │
+│  │  │ - 店铺 CRUD   │  │ ● 代理路由    │  │ ● 分页 / DSL 查询 │ │ │
+│  │  │ - 应用管理    │  │ ● 限速+重试   │  │ ● 批量读写        │ │ │
+│  │  └──────┬────────┘  └───────┬───────┘  └────────┬──────────┘ │ │
+│  │         ▼                   │                    │            │ │
+│  │  ┌──────────────┐  ┌───────┴────────┐           │            │ │
+│  │  │ SQLite(WAL)  │  │ Scheduler      │           │            │ │
+│  │  │ - stores     │  │ (APScheduler)  │           │            │ │
+│  │  │ - app_configs│  │ 应用注册/注销   │           │            │ │
+│  │  │ - sync_logs  │  └────────────────┘           │            │ │
+│  │  └──────────────┘                                │            │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                    │
+│         代理IP-A          代理IP-B          代理IP-C               │
+│            │                 │                 │                   │
+└────────────┼─────────────────┼─────────────────┼───────────────────┘
+             ▼                 ▼                 ▼
+        Shopify-A         Shopify-B         Shopify-C
 ```
 
 ## 2. 技术栈
@@ -58,175 +53,310 @@
 | 反向代理 | Nginx + Let's Encrypt | 中台（可选） |
 | 前端页面 | 原生 HTML + JS | 中台 |
 | 定时调度 | APScheduler | 中台 |
-| HTTP 请求 | requests | 中台 |
-| 数据存储 | SQLite (WAL 模式) | 中台 |
+| HTTP 请求 | requests + PySocks | 中台 |
 | Token 加密 | cryptography (Fernet) | 中台 |
 | 密码哈希 | bcrypt | 中台 |
-| 代理支持 | PySocks + requests | 中台 |
-| 限速 | flask-limiter | 中台 |
-| 安全头 | flask-talisman | 中台 |
-| CSRF 保护 | flask-wtf (CSRFProtect) | 中台 |
+| 安全 | flask-limiter / flask-talisman / flask-wtf | 中台 |
 | 进程管理 | launchd (macOS) | 中台 |
-| 飞书写入 | lark-cli (subprocess) | 应用层 |
-| HTML 消毒 | bleach | 应用层 |
-| HTML 转文本 | html2text | 应用层 |
+| 飞书读写 | lark-cli (subprocess) | 中台 |
+| HTML 消毒 | bleach | 应用 |
+| HTML 转文本 | html2text | 应用 |
 
 ## 3. 项目结构
 
 ```
 shopifyproduct/
-  PRD.md                       # 需求文档（运营看）
+  PRD.md                       # 需求文档
   TECHNICAL.md                 # 技术文档（本文件）
-  COMPLIANCE_PROMPT.md         # 合规改写规则（.gitignore 排除）
-  requirements.txt             # Python 依赖
+  COMPLIANCE_PROMPT.md         # 合规规则（.gitignore 排除）
+  requirements.txt
   .gitignore
 
   ── 中台核心层 ──
 
   core/
     __init__.py
-    shopify_client.py          # Shopify API 统一客户端（认证、代理、限速）
-    shopify_auth.py            # 认证逻辑（Token / OAuth 双模式）
-    store_manager.py           # 店铺 CRUD 操作
-    db.py                      # SQLite 数据库操作
-    crypto.py                  # Token 加密解密
+    shopify_client.py          # Shopify API 统一客户端
+    shopify_auth.py            # 认证（Token / OAuth）
+    lark_client.py             # lark-cli 封装（分页、批量、DSL）
+    store_manager.py           # 店铺 CRUD
+    app_registry.py            # 应用发现与注册
+    db.py                      # SQLite 操作
+    crypto.py                  # Fernet 加密解密
     validators.py              # 输入校验
-    scheduler.py               # APScheduler 调度器管理
+    scheduler.py               # APScheduler 管理
 
   web/
     __init__.py
-    routes.py                  # Flask 路由（店铺管理 + 应用入口）
+    routes.py                  # Flask 路由（中台 + 应用入口）
     templates/
       index.html               # 管理后台页面
 
-  ── 业务应用层 ──
+  ── 业务应用层（每个应用一个独立目录） ──
 
   apps/
     __init__.py
-    sync/
-      __init__.py
-      light_sync.py            # 轻量扫描（新产品 + 基础字段变化）
-      deep_sync.py             # 深度扫描（SEO + 图片Alt，分批循环）
-      writeback.py             # 合规回写
-      lark_writer.py           # lark-cli 命令封装
-      models.py                # 同步相关数据结构
-    # 未来应用在此添加
-    # product_copy/
-    # report_export/
+    base.py                    # 应用基类 / 接口定义
+
+    sync/                      # 应用1：产品同步（Shopify → 飞书）
+      __init__.py              #   声明 app_name, config_schema, tasks
+      light_sync.py            #   轻量扫描
+      deep_sync.py             #   深度扫描
+      models.py                #   数据结构
+
+    compliance/                # 应用2：合规检查（飞书 → 检查 → 飞书）
+      __init__.py              #   声明 app_name, config_schema, tasks
+      checker.py               #   风控规则检测
+      rewriter.py              #   自动改写
+
+    writeback/                 # 应用3：合规回写（飞书 → Shopify）
+      __init__.py              #   声明 app_name, config_schema, tasks
+      writer.py                #   回写逻辑
+
+    # ── 未来应用 ──
+    # product_copy/            # A站 → B站
+    # report_export/           # 多店报表
 
   ── 启动与部署 ──
 
   scripts/
-    start.sh                   # launchd 启动入口
-    main.py                    # 应用入口（Flask + Scheduler）
-
-  nginx/
-    shopifyproduct.conf        # Nginx 配置模板
+    start.sh
+    main.py                    # Flask + Scheduler 入口
 
   deploy/
-    com.shopifyproduct.plist   # macOS launchd 服务文件
-    .env.example               # 环境变量模板
+    com.shopifyproduct.plist
+    .env.example
 
-  logs/                        # 运行日志
-  data/                        # SQLite 数据库文件（chmod 600）
+  logs/
+  data/
 ```
 
-## 4. 中台核心层
+## 4. 应用接口规范（`apps/base.py`）
 
-### 4.1 Shopify Client（`core/shopify_client.py`）
+每个应用必须实现以下接口，中台通过此接口自动发现和管理应用：
 
-这是中台的核心——一个统一的 Shopify API 客户端。上层应用通过它访问 Shopify，无需关心认证、代理、限速等细节。
+```python
+# apps/base.py
+from abc import ABC, abstractmethod
+
+class BaseApp(ABC):
+    """所有业务应用的基类"""
+
+    @property
+    @abstractmethod
+    def app_name(self) -> str:
+        """唯一标识，如 'sync', 'compliance', 'writeback'"""
+        ...
+
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """应用描述，显示在管理后台"""
+        ...
+
+    @property
+    def config_schema(self) -> dict:
+        """应用需要的配置字段及默认值，存入 app_configs 表
+        返回 {} 表示不需要额外配置"""
+        return {}
+
+    def get_scheduled_tasks(self, store, config) -> list:
+        """返回该店铺需要注册的定时任务
+        返回 [] 表示不需要定时任务
+        每个 task: {"func": callable, "trigger": CronTrigger, "id_suffix": str}
+        """
+        return []
+
+    def get_routes(self):
+        """返回应用专属的 Flask Blueprint（可选）
+        返回 None 表示不需要额外路由"""
+        return None
+```
+
+**应用注册示例（`apps/sync/__init__.py`）：**
+
+```python
+from apps.base import BaseApp
+from apscheduler.triggers.cron import CronTrigger
+
+class SyncApp(BaseApp):
+    app_name = "sync"
+    description = "产品数据同步（Shopify → 飞书）"
+
+    config_schema = {
+        "light_cron": "0 3 * * *",   # 轻量扫描 cron
+        "deep_cycle": 3,              # 深度扫描周期（天）
+        "deep_hour": 4,               # 深度扫描时间
+        "deep_offset": 0,             # 内部：当前偏移量
+    }
+
+    def get_scheduled_tasks(self, store, config):
+        from .light_sync import light_sync
+        from .deep_sync import deep_sync
+        return [
+            {
+                "func": light_sync,
+                "trigger": CronTrigger.from_crontab(config["light_cron"]),
+                "id_suffix": "light"
+            },
+            {
+                "func": deep_sync,
+                "trigger": CronTrigger(hour=config["deep_hour"], minute=0),
+                "id_suffix": "deep"
+            }
+        ]
+```
+
+**合规检查应用（`apps/compliance/__init__.py`）：**
+
+```python
+class ComplianceApp(BaseApp):
+    app_name = "compliance"
+    description = "合规检查与自动改写（飞书 → 检查 → 飞书）"
+
+    config_schema = {
+        "check_cron": "0 * * * *",    # 每小时检查一次
+    }
+
+    def get_scheduled_tasks(self, store, config):
+        from .checker import compliance_check
+        return [
+            {
+                "func": compliance_check,
+                "trigger": CronTrigger.from_crontab(config["check_cron"]),
+                "id_suffix": "check"
+            }
+        ]
+```
+
+**回写应用（`apps/writeback/__init__.py`）：**
+
+```python
+class WritebackApp(BaseApp):
+    app_name = "writeback"
+    description = "合规回写（飞书 → Shopify）"
+
+    config_schema = {
+        "writeback_cron": "0 * * * *",  # 每小时回写一次
+    }
+
+    def get_scheduled_tasks(self, store, config):
+        from .writer import writeback
+        return [
+            {
+                "func": writeback,
+                "trigger": CronTrigger.from_crontab(config["writeback_cron"]),
+                "id_suffix": "wb"
+            }
+        ]
+```
+
+### 4.1 应用发现（`core/app_registry.py`）
+
+中台启动时自动扫描 `apps/` 下所有实现了 `BaseApp` 的类：
+
+```python
+import importlib, pkgutil
+from apps.base import BaseApp
+
+def discover_apps() -> dict[str, BaseApp]:
+    """扫描 apps/ 目录，返回 {app_name: app_instance}"""
+    apps = {}
+    package = importlib.import_module("apps")
+    for _, module_name, is_pkg in pkgutil.iter_modules(package.__path__):
+        if not is_pkg:
+            continue
+        module = importlib.import_module(f"apps.{module_name}")
+        for attr in dir(module):
+            cls = getattr(module, attr)
+            if (isinstance(cls, type) and issubclass(cls, BaseApp)
+                    and cls is not BaseApp):
+                instance = cls()
+                apps[instance.app_name] = instance
+    return apps
+```
+
+**新增应用不需要修改任何已有代码：** 只需在 `apps/` 下创建新目录 + 实现 `BaseApp` 子类，重启即自动加载。
+
+---
+
+## 5. 中台核心层
+
+### 5.1 ShopifyClient（`core/shopify_client.py`）
 
 ```python
 class ShopifyClient:
-    """每个 store 实例对应一个 client，自动处理认证和代理"""
+    """统一 Shopify API 客户端，自动处理认证、代理、限速"""
 
     def __init__(self, store):
         self.store = store
         self._proxies = {"http": store.proxy, "https": store.proxy}
 
-    # ── 前端操作（不需要 Token） ──
+    # ── 前端（不需要 Token） ──
+    def list_products(self) -> list: ...
+    def get_product(self, handle: str) -> dict: ...
+    def get_product_seo(self, handle: str) -> dict: ...
 
-    def list_products(self) -> list:
-        """分页获取所有产品列表（前端 /products.json）"""
-        ...
+    # ── Admin API（需要 Token） ──
+    def get_product_admin(self, product_id: str) -> dict: ...
+    def get_product_collections(self, product_id: str) -> list: ...
+    def update_product(self, product_id: str, data: dict) -> bool: ...
+    def update_product_seo(self, product_id: str, title=None, description=None) -> bool: ...
 
-    def get_product(self, handle: str) -> dict:
-        """获取单个产品详情（前端 /products/{handle}.json）"""
-        ...
-
-    def get_product_seo(self, handle: str) -> dict:
-        """从前端 HTML 解析 SEO 标题和描述"""
-        ...
-
-    # ── Admin API 操作（需要 Token） ──
-
-    def get_product_admin(self, product_id: str) -> dict:
-        """获取产品完整数据（含 status 等前端没有的字段）"""
-        ...
-
-    def get_product_collections(self, product_id: str) -> list:
-        """获取产品所属集合"""
-        ...
-
-    def update_product(self, product_id: str, data: dict) -> bool:
-        """更新产品（标题、描述、标签、Handle、图片Alt、规格等）"""
-        ...
-
-    def update_product_seo(self, product_id: str, title: str = None, description: str = None) -> bool:
-        """更新 SEO 元字段"""
-        ...
-
-    # ── 内部方法 ──
-
-    def _request_frontend(self, path: str) -> requests.Response:
-        """前端请求（带代理，1-2秒间隔 + 随机抖动）"""
-        ...
-
-    def _request_admin(self, method: str, path: str, json=None) -> requests.Response:
-        """Admin API 请求（带代理、认证头、限速处理）"""
-        ...
-
-    def _get_auth_headers(self) -> dict:
-        """统一获取认证头（Token 直接用，OAuth 自动续期）"""
-        ...
-
+    # ── 内部 ──
+    def _request_frontend(self, path) -> requests.Response: ...
+    def _request_admin(self, method, path, json=None) -> requests.Response: ...
+    def _get_auth_headers(self) -> dict: ...
 
 def get_client(store) -> ShopifyClient:
-    """工厂方法：根据 store 配置创建客户端"""
     return ShopifyClient(store)
 ```
 
-**关键设计：**
-- 上层应用只需 `client = get_client(store)` 然后调用方法
-- 认证、代理、限速全部在 client 内部处理
-- 未来新应用（产品复制、报表导出）使用同一个 client
-
-### 4.2 认证模块（`core/shopify_auth.py`）
-
-#### 方式一：Legacy Token（`auth_mode = "token"`）
-
-直接使用永久 Access Token：
+### 5.2 LarkClient（`core/lark_client.py`）
 
 ```python
-headers = {
-    "X-Shopify-Access-Token": decrypt(store.api_token),
-    "Content-Type": "application/json"
-}
+class LarkClient:
+    """lark-cli 封装，提供统一的飞书多维表操作"""
+
+    def __init__(self, base_token: str):
+        self.base_token = base_token
+
+    def list_records(self, table_id, jq_filter=None) -> list:
+        """分页读取记录（可选 jq 过滤）"""
+        ...
+
+    def batch_create(self, table_id, records: list) -> list:
+        """批量创建记录"""
+        ...
+
+    def batch_update(self, table_id, updates: list) -> bool:
+        """批量更新记录"""
+        ...
+
+    def query(self, table_id, dsl: dict) -> list:
+        """DSL 条件查询（合规检查、回写时用）"""
+        ...
+
+    def _run(self, args: list) -> dict:
+        """执行 lark-cli 命令（列表形式，禁止 shell=True，超时 30s）"""
+        ...
 ```
 
-#### 方式二：OAuth Client Credentials（`auth_mode = "oauth"`）
+**安全规范：**
+- JSON 参数用 `json.dumps()` 构建，禁止字符串拼接
+- subprocess 用列表形式，禁止 `shell=True`
+- store_name 等用户输入经 `validate_store_name()` 校验后再用 `json.dumps()` 转义拼入 jq
+
+### 5.3 认证（`core/shopify_auth.py`）
 
 ```python
 def get_oauth_token(store):
-    """获取 OAuth access token，过期则重新申请"""
-    # 1. 检查现有 token 是否还有效（提前 5 分钟刷新）
+    """OAuth token，过期自动重新获取"""
     if store.oauth_token and store.oauth_expires:
         expires = datetime.fromisoformat(store.oauth_expires)
         if datetime.utcnow() < expires - timedelta(minutes=5):
             return decrypt(store.oauth_token)
 
-    # 2. 用 client credentials 获取新 token（Shopify 不返回 refresh token）
     resp = requests.post(
         f"https://{store.shop}.myshopify.com/admin/oauth/access_token",
         json={
@@ -234,77 +364,66 @@ def get_oauth_token(store):
             "client_secret": decrypt(store.client_secret),
             "grant_type": "client_credentials"
         },
-        proxies=get_proxies(store),
-        timeout=10
+        proxies=get_proxies(store), timeout=10
     )
     resp.raise_for_status()
     data = resp.json()
-
-    new_token = data["access_token"]
     update_store_oauth(store.id,
-        oauth_token=encrypt(new_token),
+        oauth_token=encrypt(data["access_token"]),
         oauth_expires=(datetime.utcnow() + timedelta(hours=24)).isoformat()
     )
-    return new_token
+    return data["access_token"]
 ```
 
-| 凭证 | 有效期 | 处理方式 |
-|------|-------|---------|
-| Access Token | 永久 | 直接使用 |
-| OAuth Access Token | 24 小时 | 过期自动重新获取 |
-| Client ID / Secret | 永久 | 加密存储 |
+| 凭证 | 有效期 | 处理 |
+|------|-------|------|
+| Access Token | 永久 | 直接用 |
+| OAuth Token | 24h | 自动续期 |
+| Client ID/Secret | 永久 | 加密存储 |
 
-**401 处理：** OAuth 模式收到 401 时，清除 oauth_token，重新获取。若仍 401，标记"凭证过期"。
+401 处理：OAuth 收到 401 → 清缓存重新获取 → 仍 401 → 标记"凭证过期"。
 
-### 4.3 数据库设计（SQLite，WAL 模式）
+### 5.4 数据库设计
 
-初始化时执行 `PRAGMA journal_mode=WAL;`。
-
-#### stores 表
+#### stores 表（中台级别）
 
 ```sql
 CREATE TABLE stores (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    store_name     TEXT NOT NULL UNIQUE,          -- 只允许 [a-zA-Z0-9_-]
-    shop           TEXT NOT NULL,                 -- myshopify.com 前缀
-    storefront     TEXT NOT NULL,                 -- 前端域名
-    auth_mode      TEXT NOT NULL DEFAULT 'token', -- 'token' 或 'oauth'
-    api_token      TEXT,                          -- 加密后的 Admin API Token
-    client_id      TEXT,                          -- OAuth Client ID（不加密）
-    client_secret  TEXT,                          -- 加密后的 Client Secret
-    oauth_token    TEXT,                          -- 加密后的当前 access token
-    oauth_expires  TEXT,                          -- token 过期时间 ISO8601
-    proxy          TEXT NOT NULL,                 -- 代理地址
-    table_id       TEXT NOT NULL,                 -- 飞书 Table ID
+    store_name     TEXT NOT NULL UNIQUE,
+    shop           TEXT NOT NULL,
+    storefront     TEXT NOT NULL,
+    auth_mode      TEXT NOT NULL DEFAULT 'token',
+    api_token      TEXT,
+    client_id      TEXT,
+    client_secret  TEXT,
+    oauth_token    TEXT,
+    oauth_expires  TEXT,
+    proxy          TEXT NOT NULL,
+    table_id       TEXT NOT NULL,
     enabled        INTEGER NOT NULL DEFAULT 1,
     created_at     TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at     TEXT DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
-#### app_configs 表（应用专属配置）
+#### app_configs 表（应用配置，完全解耦）
 
 ```sql
 CREATE TABLE app_configs (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     store_id   INTEGER NOT NULL,
-    app_name   TEXT NOT NULL,                    -- 应用标识，如 'sync'
-    config     TEXT NOT NULL DEFAULT '{}',       -- JSON 格式的应用配置
+    app_name   TEXT NOT NULL,
+    config     TEXT NOT NULL DEFAULT '{}',  -- JSON
     enabled    INTEGER NOT NULL DEFAULT 1,
     FOREIGN KEY (store_id) REFERENCES stores(id),
     UNIQUE(store_id, app_name)
 );
 
--- 产品同步应用的 config 示例：
--- {
---   "light_cron": "0 3 * * *",
---   "deep_cycle": 3,
---   "deep_hour": 4,
---   "deep_offset": 0
--- }
+-- sync 应用: {"light_cron":"0 3 * * *","deep_cycle":3,"deep_hour":4,"deep_offset":0}
+-- compliance 应用: {"check_cron":"0 * * * *"}
+-- writeback 应用: {"writeback_cron":"0 * * * *"}
 ```
-
-> **设计思路：** 店铺基础信息（凭证、代理）属于中台，应用专属配置（扫描频率等）属于应用层。`app_configs` 表通过 `app_name` 区分不同应用，未来新应用只需插入新行，无需改表结构。
 
 #### settings 表
 
@@ -313,59 +432,44 @@ CREATE TABLE settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
--- 预设: lark_base_token（Fernet 加密存储）
+-- lark_base_token（Fernet 加密）
 ```
 
-#### sync_logs 表
+#### sync_logs 表（所有应用共用，按 app_name 区分）
 
 ```sql
 CREATE TABLE sync_logs (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     store_id   INTEGER NOT NULL,
-    app_name   TEXT NOT NULL DEFAULT 'sync',     -- 哪个应用产生的日志
-    action     TEXT NOT NULL,                    -- sync / writeback / product_copy / ...
-    status     TEXT NOT NULL,                    -- success / failed
+    app_name   TEXT NOT NULL,       -- 'sync' / 'compliance' / 'writeback' / ...
+    action     TEXT NOT NULL,       -- light_sync / deep_sync / check / writeback / ...
+    status     TEXT NOT NULL,       -- success / failed
     summary    TEXT,
-    detail     TEXT,                             -- 完整日志（已脱敏）
+    detail     TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (store_id) REFERENCES stores(id)
 );
 ```
 
-#### SQL 安全规范
-
-所有查询必须使用参数化：
-
-```python
-# 正确
-cursor.execute("SELECT * FROM stores WHERE store_name = ?", (name,))
-
-# 错误 — 禁止
-cursor.execute(f"SELECT * FROM stores WHERE store_name = '{name}'")
-```
-
-### 4.4 输入校验（`core/validators.py`）
+### 5.5 输入校验（`core/validators.py`）
 
 ```python
 import re, socket, ipaddress
 
-STORE_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
-SHOP_RE = re.compile(r'^[a-z0-9-]+$')
-PROXY_RE = re.compile(r'^(socks5|https?)://[a-zA-Z0-9._-]+:\d+$')
-STOREFRONT_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$')
-HANDLE_RE = re.compile(r'^[a-z0-9-]+$')
-PRODUCT_ID_RE = re.compile(r'^\d+$')
+STORE_NAME_RE  = re.compile(r'^[a-zA-Z0-9_-]+$')
+SHOP_RE        = re.compile(r'^[a-z0-9-]+$')
+PROXY_RE       = re.compile(r'^(socks5|https?)://[a-zA-Z0-9._-]+:\d+$')
+STOREFRONT_RE  = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$')
+HANDLE_RE      = re.compile(r'^[a-z0-9-]+$')
+PRODUCT_ID_RE  = re.compile(r'^\d+$')
 
-def _is_private_ip(host: str) -> bool:
-    """检查 IP 或主机名是否解析到私有/保留地址（防 SSRF）"""
+def _is_private_ip(host):
     try:
         addr = ipaddress.ip_address(host)
         return addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local
-    except ValueError:
-        pass
+    except ValueError: pass
     try:
-        resolved = socket.getaddrinfo(host, None)
-        for _, _, _, _, sockaddr in resolved:
+        for _, _, _, _, sockaddr in socket.getaddrinfo(host, None):
             addr = ipaddress.ip_address(sockaddr[0])
             if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
                 return True
@@ -377,12 +481,10 @@ def validate_store_name(name): return bool(STORE_NAME_RE.match(name)) and len(na
 def validate_shop(shop):       return bool(SHOP_RE.match(shop)) and len(shop) <= 100
 def validate_proxy(proxy):
     if not PROXY_RE.match(proxy): return False
-    host = proxy.split('://')[1].rsplit(':', 1)[0]
-    return not _is_private_ip(host)
+    return not _is_private_ip(proxy.split('://')[1].rsplit(':', 1)[0])
 def validate_storefront(domain):
     if not STOREFRONT_RE.match(domain) or len(domain) > 253: return False
-    try:
-        ipaddress.ip_address(domain); return False
+    try: ipaddress.ip_address(domain); return False
     except ValueError: pass
     return not _is_private_ip(domain)
 def validate_product_id(pid):  return bool(PRODUCT_ID_RE.match(pid)) and len(pid) <= 20
@@ -390,164 +492,14 @@ def validate_handle(handle):   return bool(HANDLE_RE.match(handle)) and len(hand
 def validate_hour(hour):       return isinstance(hour, int) and 0 <= hour <= 23
 ```
 
-### 4.5 Web 管理后台
-
-#### 页面
-
-单页面，内联表格编辑。分为两个区域：
-1. **中台配置区：** 店铺基础信息（名称、标识、域名、认证、代理）
-2. **应用配置区：** 根据启用的应用显示对应配置（如同步应用的扫描频率）
-
-**店铺字段（中台）：**
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| 店铺名称 | 是 | 只允许字母、数字、连字符、下划线 |
-| 店铺标识 | 是 | myshopify.com 前缀 |
-| 前端域名 | 是 | 客户访问的自定义域名 |
-| 认证方式 | 是 | Token / OAuth |
-| Access Token | Token时必填 | 加密存储，页面星号遮蔽 |
-| Client ID | OAuth时必填 | |
-| Client Secret | OAuth时必填 | 加密存储，页面星号遮蔽 |
-| 代理IP | 是 | `socks5://ip:port` 或 `http://ip:port` |
-| 飞书 Table ID | 是 | 该店铺对应的多维表 table ID |
-
-**同步应用字段（应用层）：**
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| 轻量扫描频率 | 是 | 每小时/每6小时/每天+时间 |
-| 深度扫描周期 | 是 | 1/2/3/5/7 天 |
-| 深度扫描时间 | 是 | 0-23 |
-
-**操作：**
-- 通用：保存 / 删除 / 测试连接 / 查看日志
-- 同步应用：立即同步
-
-#### 认证与安全
-
-**Session 登录 + bcrypt + CSRF + TLS：**
+### 5.6 调度器（`core/scheduler.py`）
 
 ```python
-import bcrypt
-from flask_login import LoginManager, login_required
-from flask_wtf.csrf import CSRFProtect
-
-csrf = CSRFProtect(app)
-login_manager = LoginManager(app)
-
-ADMIN_USER = os.environ["ADMIN_USER"]
-ADMIN_PASS_HASH = os.environ["ADMIN_PASS_HASH"]  # bcrypt 哈希
-
-# 启动时检测默认密码
-if bcrypt.checkpw(b"changeme", ADMIN_PASS_HASH.encode()):
-    sys.exit("ERROR: 请修改默认密码")
-
-def verify_login(username, password):
-    return (username == ADMIN_USER and
-            bcrypt.checkpw(password.encode(), ADMIN_PASS_HASH.encode()))
-```
-
-- Session 超时 30 分钟
-- 所有非 GET 端点强制 CSRF
-- 登录限速：5次/15分钟
-- Token 查看限速：5次/分钟
-- 安全头：`Talisman(app, content_security_policy={"default-src": "'self'"})`
-
-#### API 路由
-
-```
-── 中台路由 ──
-GET    /                        → 管理后台页面（需登录）
-GET    /login                   → 登录页面
-POST   /login                   → 登录验证（限速 5次/15分钟）
-GET    /healthz                 → 健康检查（无需登录）
-GET    /api/stores              → 获取所有店铺（敏感字段星号化）
-POST   /api/stores              → 新增店铺
-PUT    /api/stores/<id>         → 更新店铺
-DELETE /api/stores/<id>         → 删除店铺
-POST   /api/stores/<id>/test   → 测试连接
-GET    /api/stores/<id>/token  → 获取明文 token（限速，有审计日志）
-GET    /api/stores/<id>/logs   → 获取日志
-GET    /api/settings            → 获取全局设置
-PUT    /api/settings            → 更新全局设置
-
-── 同步应用路由 ──
-GET    /api/stores/<id>/sync-config   → 获取同步配置
-PUT    /api/stores/<id>/sync-config   → 更新同步配置
-POST   /api/stores/<id>/sync          → 手动触发同步
-```
-
-#### 凭证安全
-
-- `cryptography.fernet.Fernet` 对称加密
-- 密钥从环境变量 `FERNET_KEY` 读取
-- 加密字段：`api_token`, `client_secret`, `oauth_token`, `lark_base_token`
-- `client_id` 不加密（非敏感）
-- API 返回时敏感字段替换为星号
-- 日志脱敏
-
-### 4.6 Shopify API 对接（中台内部）
-
-#### 接口列表
-
-**前端端点（无需认证）：**
-
-```
-GET https://{storefront}/products.json?limit=250&page=1    # 产品列表
-GET https://{storefront}/products/{handle}.json             # 产品详情
-GET https://{storefront}/products/{handle}                  # HTML → SEO
-```
-
-**Admin API 端点（需认证）：**
-
-```
-GET  /admin/api/2024-10/products/{id}.json                  # 产品完整数据
-GET  /admin/api/2024-10/collects.json?product_id={id}       # 所属集合
-GET  /admin/api/2024-10/collections/{cid}.json              # 集合详情
-PUT  /admin/api/2024-10/products/{id}.json                  # 更新产品
-PUT  /admin/api/2024-10/products/{id}/metafields.json       # 更新 SEO
-```
-
-#### 速率限制
-
-- Admin API：2 请求/秒，监控 `X-Shopify-Shop-Api-Call-Limit` 响应头
-- 剩余额度 < 5 时 sleep 1 秒
-- 429 指数退避重试（1s → 2s → 4s），最多 3 次
-- 前端请求间隔 1-2 秒 + 0-0.5 秒随机抖动
-
-#### 代理
-
-所有 Shopify 请求走该店铺的代理：
-
-```python
-def get_proxies(store):
-    return {"http": store.proxy, "https": store.proxy}
-```
-
-飞书 API（lark-cli）不走代理。
-
-#### API Version
-
-硬编码 `2024-10`，启动时检查是否即将过期（> 10 个月输出 WARNING）。
-
-### 4.7 调度器（`core/scheduler.py`）
-
-Web 后台和调度器运行在**同一个进程**中：
-
-```python
-from apscheduler.schedulers.background import BackgroundScheduler
-
 class TaskScheduler:
-    """中台调度器，管理所有应用的定时任务"""
-
     def __init__(self):
         self.scheduler = BackgroundScheduler()
 
     def register_app_tasks(self, store, app_name, tasks):
-        """为某个店铺注册应用的定时任务
-        tasks: [{"func": callable, "trigger": CronTrigger, "id_suffix": str}]
-        """
         for task in tasks:
             job_id = f"{app_name}_{store.id}_{task['id_suffix']}"
             self.scheduler.add_job(
@@ -556,7 +508,6 @@ class TaskScheduler:
             )
 
     def unregister_app_tasks(self, store_id, app_name):
-        """注销某个店铺某个应用的所有任务"""
         for job in self.scheduler.get_jobs():
             if job.id.startswith(f"{app_name}_{store_id}_"):
                 job.remove()
@@ -565,310 +516,293 @@ class TaskScheduler:
         self.scheduler.start()
 ```
 
-同步应用注册任务示例：
+**启动流程：**
 
 ```python
-# apps/sync/ 注册到调度器
-scheduler.register_app_tasks(store, "sync", [
-    {
-        "func": light_sync,
-        "trigger": CronTrigger.from_crontab(config["light_cron"]),
-        "id_suffix": "light"
-    },
-    {
-        "func": deep_sync,
-        "trigger": CronTrigger(hour=config["deep_hour"], minute=0),
-        "id_suffix": "deep"
-    }
-])
+# scripts/main.py
+def create_app():
+    app = create_flask_app()
+    scheduler = TaskScheduler()
+    registered_apps = discover_apps()  # 自动发现
 
-# 全局回写（每小时）
-scheduler.scheduler.add_job(writeback, CronTrigger.from_crontab("0 * * * *"), id="writeback")
+    with app.app_context():
+        for store in get_enabled_stores():
+            for app_name, app_instance in registered_apps.items():
+                config = get_app_config(store.id, app_name)
+                if config and config.enabled:
+                    tasks = app_instance.get_scheduled_tasks(store, config.config)
+                    scheduler.register_app_tasks(store, app_name, tasks)
+
+        # 注册应用路由
+        for app_name, app_instance in registered_apps.items():
+            blueprint = app_instance.get_routes()
+            if blueprint:
+                app.register_blueprint(blueprint)
+
+        scheduler.start()
+    return app
 ```
 
-**并发保护：** 文件锁（`fcntl.flock`）按店铺粒度加锁。手动同步用非阻塞锁 `LOCK_NB`。OAuth 刷新用独立锁。
+**并发保护：** 文件锁 `fcntl.flock` 按 `{app_name}_{store_id}` 粒度。OAuth 刷新独立锁。
+
+### 5.7 Web 管理后台
+
+#### API 路由
+
+```
+── 中台路由 ──
+GET    /                            → 管理后台页面
+GET    /login                       → 登录页
+POST   /login                       → 登录（限速 5次/15分钟）
+GET    /healthz                     → 健康检查
+GET    /api/stores                  → 所有店铺
+POST   /api/stores                  → 新增店铺
+PUT    /api/stores/<id>             → 更新店铺
+DELETE /api/stores/<id>             → 删除店铺
+POST   /api/stores/<id>/test       → 测试连接
+GET    /api/stores/<id>/token      → 明文 token（限速+审计）
+GET    /api/stores/<id>/logs       → 日志（可按 app_name 筛选）
+GET    /api/settings                → 全局设置
+PUT    /api/settings                → 更新全局设置
+
+── 应用配置路由 ──
+GET    /api/apps                    → 已发现的所有应用列表
+GET    /api/stores/<id>/apps        → 该店铺已启用的应用及配置
+PUT    /api/stores/<id>/apps/<app>  → 更新应用配置 / 启停应用
+
+── 应用专属路由（由应用自行注册） ──
+POST   /api/stores/<id>/sync       → [sync] 手动触发同步
+POST   /api/stores/<id>/check      → [compliance] 手动触发检查
+POST   /api/stores/<id>/writeback  → [writeback] 手动触发回写
+```
+
+#### 认证与安全
+
+- Session 登录 + bcrypt + CSRF + flask-talisman
+- 超时 30 分钟
+- 登录限速 5次/15分钟
+- 凭证 Fernet 加密，密钥从 `FERNET_KEY` 环境变量读取
+
+### 5.8 Shopify API 对接
+
+#### 接口列表
+
+| 端点 | 用途 | Token |
+|------|------|-------|
+| `GET {storefront}/products.json` | 产品列表 | 否 |
+| `GET {storefront}/products/{handle}.json` | 产品详情 | 否 |
+| `GET {storefront}/products/{handle}` | HTML → SEO | 否 |
+| `GET /admin/api/2024-10/products/{id}.json` | 完整数据 | 是 |
+| `GET /admin/api/2024-10/collects.json` | 所属集合 | 是 |
+| `PUT /admin/api/2024-10/products/{id}.json` | 更新产品 | 是 |
+| `PUT /admin/api/2024-10/products/{id}/metafields.json` | 更新 SEO | 是 |
+
+#### 限速
+
+- Admin API：2 req/s，监控 `X-Shopify-Shop-Api-Call-Limit`
+- 额度 < 5 → sleep 1s
+- 429 → 指数退避（1s → 2s → 4s），最多 3 次
+- 前端：1-2s 间隔 + 0-0.5s 随机抖动
 
 ---
 
-## 5. 业务应用层：产品同步
+## 6. 业务应用层
 
-### 5.1 轻量扫描（`apps/sync/light_sync.py`）
+### 6.1 产品同步（`apps/sync/`）
+
+**依赖：** `core.shopify_client` + `core.lark_client`
+**不依赖：** compliance / writeback / 任何其他应用
+
+#### 轻量扫描
 
 ```
 light_sync(store_id)
-    │
-    ▼
-获取文件锁 → client = get_client(store)
-    │
-    ▼
-client.list_products() — 前端 /products.json 分页拿完
-    │
-    ▼
-从飞书多维表读取该店铺现有记录 → 构建 {product_id: record_id} 映射
-    │
-    ▼
-对比产品列表
-    │
-    ├─── 新产品
-    │    ├── 从前端 JSON 提取：title、body_html、tags、product_type、handle、images、variants
-    │    ├── client.get_product_admin(id) → 获取 status
-    │    ├── client.get_product_seo(handle) → 获取 SEO
-    │    ├── client.get_product_collections(id) → 获取集合
-    │    └── 写入多维表，合规状态 = "待检查"
-    │
-    ├─── 已有产品
-    │    ├── 跳过回写保护期（已回写 且 24小时内）
-    │    ├── 对比字段，有变化 → 更新 + 重置"待检查"
-    │    └── 无变化 → 跳过
-    │
-    └─── 已删除产品 → 标记"已删除"
-
-释放文件锁
+  → get_client(store).list_products()
+  → lark.list_records(table_id, filter=store_name)
+  → 对比：新产品写入 / 已有更新 / 已删除标记
+  → 合规状态 = "待检查"（新产品或字段变化时）
 ```
 
-### 5.2 深度扫描（`apps/sync/deep_sync.py`）
+#### 深度扫描
 
 ```
 deep_sync(store_id)
-    │
-    ▼
-获取文件锁 → client = get_client(store)
-    │
-    ▼
-从飞书读取所有产品（按 ID 排序）
-batch_size = ceil(total / deep_cycle)
-    │
-    ▼
-首次（deep_offset == 0 且无记录）→ 全量扫描
-非首次 → 取 products[offset : offset + batch_size]
-    │
-    ▼
-对每个产品（间隔 1-2 秒）：
-    ├── client.get_product_seo(handle) → SEO 变化检测
-    ├── client.get_product(handle) → 图片 alt / variant option 变化
-    └── 更新产品图片字段
-    │
-    ▼
-更新 deep_offset（循环到头则重置为 0）
-
-释放文件锁
+  → 从飞书读取所有产品，按 deep_cycle 计算本批范围
+  → 首次全量，后续分批
+  → client.get_product_seo(handle) → SEO 变化
+  → client.get_product(handle) → 图片 alt / variant 变化
+  → 更新 deep_offset
 ```
 
-### 5.3 合规回写（`apps/sync/writeback.py`）
+### 6.2 合规检查（`apps/compliance/`）
+
+**依赖：** `core.lark_client`
+**不依赖：** shopify_client / sync / writeback
 
 ```
-writeback()
-    │
-    ▼
-遍历所有启用的店铺：
-    │
-    ▼
-从飞书查找：合规状态 == "已改写" AND 回写状态 != "已回写"
-    │
-    ▼
-对每条记录：
-    ├── 校验 product_id + 改写字段
-    ├── client = get_client(store)
-    ├── client.update_product(id, data) — 主体更新
-    ├── client.update_product_seo(id, title, desc) — SEO 更新
-    ├── 全部成功 → 回写状态 = "已回写" + 原始字段同步更新
-    └── 任一失败 → 回写状态 = "回写失败"
+compliance_check(store_id)
+  → lark.query(table_id, dsl={合规状态 == "待检查"})
+  → 对每条记录读取 10 个可扫描字段
+  → 按 COMPLIANCE_PROMPT.md 规则检测
+  → 全部合规 → lark.batch_update(合规状态="合规")
+  → 需改写 → rewriter 生成改写内容
+           → lark.batch_update(改写字段 + 合规状态="已改写")
 ```
 
-### 5.4 数据映射
+**检查范围：** 产品标题、描述、产品类型、标签、SEO标题、SEO描述、Handle、图片Alt、规格名称、所属集合。
 
-**Admin API → 多维表字段：**
+### 6.3 合规回写（`apps/writeback/`）
 
-| API 字段 | 多维表字段 | 备注 |
-|----------|-----------|------|
-| `product.id` | Shopify产品ID | 大整数存文本 |
-| `product.title` | 产品标题 | |
-| `product.body_html` | 原始描述HTML | |
-| html2text(body_html) | 原始描述纯文本 | |
-| `product.product_type` | 产品类型 | |
-| `product.tags` | 产品标签 | 逗号分隔 |
-| `product.handle` | Handle | |
-| `product.status` | 产品状态 | |
-| `product.variants[0].price` | 价格 | |
-| `product.variants[0].sku` | SKU | |
-| `product.images[*].src` | 产品图片 | 换行分隔 |
-| `product.images[*].alt` | 图片Alt文本 | 换行分隔 |
-| `product.variants[*].featured_image.src` | Variant图片 | `option1 \| URL` |
-| `product.variants[*].option1` | 规格名称 | 换行分隔 |
-| HTML `<title>` | SEO标题 | 前端 HTML 解析 |
-| HTML `<meta description>` | SEO描述 | 前端 HTML 解析 |
-| collects → collection.title | 所属集合 | 只读 |
+**依赖：** `core.shopify_client` + `core.lark_client`
+**不依赖：** sync / compliance
 
-### 5.5 lark-cli 调用规范
-
-```bash
-# 读取记录
-lark-cli base +record-list \
-  --base-token {base_token} --table-id {table_id} \
-  --limit 100 --offset 0 \
-  --jq '.items[] | select(.fields.店铺名称 == "{store_name}")'
-
-# 批量创建
-lark-cli base +record-batch-create \
-  --base-token {base_token} --table-id {table_id} \
-  --json '{...}'
-
-# 批量更新
-lark-cli base +record-batch-update \
-  --base-token {base_token} --table-id {table_id} \
-  --json '{...}'
-
-# DSL 查询（回写时用）
-lark-cli base +data-query \
-  --base-token {base_token} \
-  --dsl '{...}'
+```
+writeback(store_id)
+  → lark.query(table_id, dsl={合规状态=="已改写" AND 回写状态≠"已回写"})
+  → 对每条记录：
+      → validate_product_id() + 校验改写字段
+      → client = get_client(store)
+      → client.update_product(id, data)
+      → client.update_product_seo(id, title, desc)
+      → 成功 → lark.batch_update(回写状态="已回写", 原始字段同步)
+      → 失败 → lark.batch_update(回写状态="回写失败")
 ```
 
-**安全规范：**
-- JSON 参数用 `json.dumps()` 构建，禁止字符串拼接
-- subprocess 用列表形式，禁止 `shell=True`
-- 超时 30 秒
-- 脱敏后记录 stderr
+### 6.4 应用依赖关系图
 
-### 5.6 飞书多维表字段设计
+```
+                core.shopify_client    core.lark_client
+                       │                      │
+         ┌─────────────┼──────────────────────┼──────────┐
+         │             │                      │          │
+         ▼             ▼                      ▼          ▼
+    ┌─────────┐   ┌─────────┐          ┌───────────┐
+    │  sync   │   │writeback│          │compliance │
+    │         │   │         │          │           │
+    │ 用 both │   │ 用 both │          │ 只用 lark │
+    └────┬────┘   └────┬────┘          └─────┬─────┘
+         │             │                     │
+         │             │                     │
+         └─────── 飞书多维表（数据总线） ──────┘
+                  字段状态驱动协作
+                  无代码级依赖
+```
 
-默认所有店铺共用一张表。唯一键为"店铺名称 + Shopify产品ID"（代码层面去重）。
+### 6.5 数据映射（sync 应用）
 
-| 序号 | 字段名 | 类型 | 写入方 | 说明 |
-|-----|-------|------|-------|------|
-| 1 | 店铺名称 | 单选 | 同步 | |
-| 2 | Shopify产品ID | 文本 | 同步 | |
-| 3 | 产品状态 | 单选 | 同步 | active/draft/archived/已删除 |
-| 4 | 价格 | 数字 | 同步 | |
-| 5 | SKU | 文本 | 同步 | |
-| 6 | 前端链接 | 链接 | 同步 | |
-| 7 | 产品图片 | 文本 | 同步 | |
-| 8 | Variant图片 | 文本 | 同步 | |
-| 9/10 | 产品标题 / 改写标题 | 文本 | 同步/外部 | |
-| 11/12 | 原始描述HTML / 改写描述 | 文本 | 同步/外部 | |
-| 13 | 原始描述纯文本 | 文本 | 同步 | |
-| 14/15 | 产品类型 / 改写产品类型 | 文本 | 同步/外部 | |
-| 16/17 | 产品标签 / 改写标签 | 文本 | 同步/外部 | |
-| 18/19 | SEO标题 / 改写SEO标题 | 文本 | 同步/外部 | |
-| 20/21 | SEO描述 / 改写SEO描述 | 文本 | 同步/外部 | |
-| 22/23 | Handle / 改写Handle | 文本 | 同步/外部 | |
-| 24/25 | 图片Alt文本 / 改写图片Alt | 文本 | 同步/外部 | |
-| 26/27 | 规格名称 / 改写规格名称 | 文本 | 同步/外部 | |
-| 28 | 所属集合 | 文本 | 同步 | 只读 |
-| 29 | 合规状态 | 单选 | 同步/外部 | 待检查/合规/已改写 |
-| 30 | 回写状态 | 单选 | 同步 | 未回写/已回写/回写失败 |
-| 31 | 最后更新时间 | 日期时间 | 同步 | |
+| API 字段 | 多维表字段 |
+|----------|-----------|
+| `product.id` | Shopify产品ID |
+| `product.title` | 产品标题 |
+| `product.body_html` | 原始描述HTML |
+| html2text(body_html) | 原始描述纯文本 |
+| `product.product_type` | 产品类型 |
+| `product.tags` | 产品标签 |
+| `product.handle` | Handle |
+| `product.status` | 产品状态 |
+| `product.variants[0].price` | 价格 |
+| `product.variants[0].sku` | SKU |
+| `product.images[*].src` | 产品图片 |
+| `product.images[*].alt` | 图片Alt文本 |
+| `product.variants[*].featured_image.src` | Variant图片 |
+| `product.variants[*].option1` | 规格名称 |
+| HTML `<title>` | SEO标题 |
+| HTML `<meta description>` | SEO描述 |
+| collects → collection.title | 所属集合 |
+
+### 6.6 飞书多维表字段
+
+| # | 字段名 | 类型 | 写入方 |
+|---|-------|------|-------|
+| 1 | 店铺名称 | 单选 | sync |
+| 2 | Shopify产品ID | 文本 | sync |
+| 3 | 产品状态 | 单选 | sync |
+| 4 | 价格 | 数字 | sync |
+| 5 | SKU | 文本 | sync |
+| 6 | 前端链接 | 链接 | sync |
+| 7 | 产品图片 | 文本 | sync |
+| 8 | Variant图片 | 文本 | sync |
+| 9/10 | 产品标题 / 改写标题 | 文本 | sync / compliance |
+| 11/12 | 原始描述HTML / 改写描述 | 文本 | sync / compliance |
+| 13 | 原始描述纯文本 | 文本 | sync |
+| 14/15 | 产品类型 / 改写产品类型 | 文本 | sync / compliance |
+| 16/17 | 产品标签 / 改写标签 | 文本 | sync / compliance |
+| 18/19 | SEO标题 / 改写SEO标题 | 文本 | sync / compliance |
+| 20/21 | SEO描述 / 改写SEO描述 | 文本 | sync / compliance |
+| 22/23 | Handle / 改写Handle | 文本 | sync / compliance |
+| 24/25 | 图片Alt文本 / 改写图片Alt | 文本 | sync / compliance |
+| 26/27 | 规格名称 / 改写规格名称 | 文本 | sync / compliance |
+| 28 | 所属集合 | 文本 | sync |
+| 29 | 合规状态 | 单选 | sync / compliance |
+| 30 | 回写状态 | 单选 | writeback |
+| 31 | 最后更新时间 | 日期时间 | 各应用 |
 
 ---
 
-## 6. 错误处理
+## 7. 错误处理
 
-| 场景 | 处理方式 | 层级 |
-|------|---------|------|
-| Shopify API 429 | 指数退避重试（1s → 2s → 4s），最多 3 次 | 中台 |
-| Shopify API 401（Token） | 标记 token 失效，跳过 | 中台 |
-| Shopify API 401（OAuth） | 清除缓存重新获取，仍 401 则标记"凭证过期" | 中台 |
-| 代理连接失败 | 标记代理异常，跳过 | 中台 |
-| 前端 JSON 404 | 跳过该产品 | 应用 |
-| 前端 JSON 超时 | 重试 2 次 | 应用 |
-| lark-cli 失败 | 重试 2 次（2s → 5s），终止该店铺同步 | 应用 |
-| 单条产品异常 | try-except，记录失败 ID，继续下一条 | 应用 |
-| 回写失败 | 标记"回写失败" | 应用 |
-| variants 为空 | 价格/SKU 填空 | 应用 |
-| 重复记录 | 已存在则改为 update | 应用 |
+| 场景 | 处理 | 层级 |
+|------|------|------|
+| Shopify 429 | 指数退避（1→2→4s），最多 3 次 | 中台 |
+| Shopify 401（Token） | 标记失效 | 中台 |
+| Shopify 401（OAuth） | 清缓存重获，仍 401 标记过期 | 中台 |
+| 代理连接失败 | 标记异常，跳过 | 中台 |
+| lark-cli 失败 | 重试 2 次（2s → 5s） | 中台 |
+| 前端 404 | 跳过该产品 | sync |
+| 前端超时 | 重试 2 次 | sync |
+| 单条产品异常 | catch，记录，继续 | sync |
+| 合规检查异常 | catch，记录，继续 | compliance |
+| 回写失败 | 标记"回写失败" | writeback |
 
-## 7. 部署（macOS / Mac mini）
+## 8. 部署
 
-### 7.1 环境要求
+### 8.1 环境要求
 
-- Mac mini（本地部署）
-- Python 3.8+
-- lark-cli 已安装并登录
-- 每个店铺一个独立代理 IP
-- 如需公网访问：Nginx/Caddy + TLS
+- Mac mini + Python 3.8+ + lark-cli
+- 每店独立代理
+- 公网访问需 Nginx + TLS
 
-### 7.2 部署步骤
+### 8.2 部署步骤
 
 ```bash
-# 1. 拉取代码
-git clone <repo-url> ~/shopifyproduct
-cd ~/shopifyproduct
-
-# 2. 安装依赖
-python3 -m venv venv
-source venv/bin/activate
+git clone <repo> ~/shopifyproduct && cd ~/shopifyproduct
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# 3. 创建 .env
+# 生成 .env
 FERNET_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
-ADMIN_PASS_HASH=$(python -c "import bcrypt; print(bcrypt.hashpw(b'你的强密码', bcrypt.gensalt()).decode())")
-
-cat > ~/shopifyproduct/.env << EOF
+ADMIN_PASS_HASH=$(python -c "import bcrypt; print(bcrypt.hashpw(b'你的密码', bcrypt.gensalt()).decode())")
+cat > .env << EOF
 FERNET_KEY=${FERNET_KEY}
 ADMIN_USER=admin
 ADMIN_PASS_HASH=${ADMIN_PASS_HASH}
 SECRET_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
 EOF
+chmod 600 .env
 
-chmod 600 ~/shopifyproduct/.env
-
-# ⚠️ 备份 FERNET_KEY！
-
-# 4. 数据库目录
-mkdir -p ~/shopifyproduct/data
-chmod 700 ~/shopifyproduct/data
-
-# 5. launchd 服务
+mkdir -p data && chmod 700 data
 cp deploy/com.shopifyproduct.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.shopifyproduct.plist
 ```
 
-### 7.3 launchd 服务
-
-通过 `scripts/start.sh` 启动（加载 .env + gunicorn）：
+### 8.3 启动脚本
 
 ```bash
 #!/bin/bash
-set -a
-source /Users/adao/shopifyproduct/.env
-set +a
+# scripts/start.sh
+set -a && source /Users/adao/shopifyproduct/.env && set +a
 cd /Users/adao/shopifyproduct
-exec /Users/adao/shopifyproduct/venv/bin/gunicorn \
-    -w 1 --threads 4 -b 0.0.0.0:8080 --timeout 120 \
+exec venv/bin/gunicorn -w 1 --threads 4 -b 0.0.0.0:8080 --timeout 120 \
     "scripts.main:create_app()"
 ```
 
-plist 配置：RunAtLoad + KeepAlive + ThrottleInterval=5。
+### 8.4 Mac mini 注意事项
 
-### 7.4 环境变量（deploy/.env.example）
+- 防休眠：系统设置 → 节能 → 勾选"防止自动进入睡眠"
+- 网络：建议有线
+- 备份：`FERNET_KEY` 必须备份
 
-```bash
-FERNET_KEY=
-ADMIN_USER=admin
-ADMIN_PASS_HASH=
-SECRET_KEY=
-```
-
-### 7.5 Nginx（可选，公网访问时需要）
-
-gunicorn 绑定 `0.0.0.0:8080`，局域网直接访问。公网需 Nginx + TLS。
-
-### 7.6 健康检查
-
-```
-GET /healthz → 200（健康）/ 503（异常）
-```
-
-检查：SQLite 可读写、APScheduler 运行中、各店铺最后同步时间正常。
-
-### 7.7 Mac mini 注意事项
-
-- **防休眠：** 系统设置 → 节能 → 勾选"防止自动进入睡眠"
-- **开机自启：** launchd + RunAtLoad
-- **网络：** 建议有线连接
-- **备份：** FERNET_KEY 必须备份到安全位置
-
-## 8. 依赖列表
+## 9. 依赖
 
 ```
 flask
