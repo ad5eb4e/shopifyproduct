@@ -252,6 +252,23 @@ def discover_apps() -> dict[str, BaseApp]:
     return apps
 ```
 
+### 4.2 新增应用步骤
+
+1. 在 `apps/` 下创建新目录（如 `apps/product_copy/`）
+2. 实现 `BaseApp` 子类，声明 `app_name`、`config_schema`、`validate_config`
+3. 实现 `get_scheduled_tasks()` 返回定时任务（可选）
+4. 实现 `get_routes()` 返回 Flask Blueprint（可选）
+5. 重启服务 → 中台自动发现并加载
+
+**无需修改 `core/`、`web/` 或其他应用的任何代码。**
+
+### 4.3 应用间解耦规则
+
+- 每个应用是独立目录，有自己的代码和配置
+- 应用之间**不互相 import**，只通过飞书多维表的字段状态交换数据
+- 应用只依赖中台提供的能力（`ShopifyClient`、`LarkClient`、`TaskScheduler`）
+- 并发保护：所有应用共享 store 级文件锁（见 5.6 节）
+
 ---
 
 ## 5. 中台核心层
@@ -725,6 +742,8 @@ writeback(store_id)
 | collects → collection.title | 所属集合 |
 
 ### 6.6 飞书多维表字段
+
+> 字段的业务含义见 PRD.md 第 5.2 节。以下为技术实现规格。
 
 | # | 字段名 | 类型 | 写入方 |
 |---|-------|------|-------|
