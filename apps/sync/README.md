@@ -1,44 +1,57 @@
-# apps/sync — 产品同步（技术文档）
+# apps/sync — 产品同步 + 回写（技术文档）
 
 > 运营说明见 [GUIDE.md](GUIDE.md)
 
 ## 职责
 
-从 Shopify 拉取产品数据 → 写入飞书多维表。
+1. **同步**：从 Shopify 拉取产品数据 → 写入飞书多维表
+2. **回写**：飞书中 `合规状态="已改写"` 时 → 将改写字段回写到 Shopify
+
+合规检查和改写由外部完成，不属于本应用。
 
 **依赖：** `core.shopify_client` + `core.lark_client`
-**不依赖：** compliance / writeback / 任何其他应用
 
 ## 应用注册
 
 ```python
 class SyncApp(BaseApp):
     app_name = "sync"
-    description = "产品数据同步（Shopify → 飞书）"
+    description = "产品同步 + 回写（Shopify ↔ 飞书）"
     config_schema = {
         "light_cron": "0 3 * * *",
         "deep_cycle": 3,
         "deep_hour": 4,
+        "writeback_cron": "0 * * * *",
     }
 
     def validate_config(self, config):
         errors = []
         if not validate_cron(config.get("light_cron", "")):
             errors.append("light_cron 格式不合法")
+        if not validate_cron(config.get("writeback_cron", "")):
+            errors.append("writeback_cron 格式不合法")
         dc = config.get("deep_cycle")
         if not isinstance(dc, int) or dc < 1 or dc > 7:
             errors.append("deep_cycle 必须为 1-7")
         if not validate_hour(config.get("deep_hour")):
             errors.append("deep_hour 必须为 0-23")
         return errors
-
-    def on_config_changed(self, store, old_config, new_config):
-        scheduler.unregister_app_tasks(store.id, self.app_name)
-        tasks = self.get_scheduled_tasks(store, new_config)
-        scheduler.register_app_tasks(store, self.app_name, tasks)
 ```
 
-## 轻量扫描（light_sync）
+## 文件结构
+
+```
+apps/sync/
+  __init__.py         # SyncApp 注册
+  light_sync.py       # 轻量扫描
+  deep_sync.py        # 深度扫描
+  writeback.py        # 回写逻辑 + 数据消毒
+  models.py           # 数据结构
+  README.md           # 技术文档（本文件）
+  GUIDE.md            # 运营说明
+```
+
+## 轻量扫描（light_sync.py）
 
 ```
 light_sync(store_id)
@@ -54,7 +67,7 @@ light_sync(store_id)
 
 **关键规则：** 重置"待检查"时**必须同时清空所有改写列**，防止旧改写数据与新内容不匹配。
 
-## 深度扫描（deep_sync）
+## 深度扫描（deep_sync.py）
 
 ```
 deep_sync(store_id)
@@ -67,6 +80,24 @@ deep_sync(store_id)
       client.get_product_seo(handle) → SEO 变化
       client.get_product(handle) → 图片 alt / variant 变化
   → 更新 app_state 中的 deep_offset
+  → 释放锁
+```
+
+## 回写（writeback.py）
+
+```
+writeback(store_id)
+  → 获取 store 级文件锁
+  → lark.query(dsl={合规状态=="已改写" AND 回写状态≠"已回写" AND 产品状态≠"已删除"})
+  → 对每条记录：
+      validate_product_id()
+      所有改写字段：长度限制 + 格式校验
+      改写描述 → bleach.clean(ALLOWED_TAGS)
+      改写标题/类型/标签/SEO/Handle/Alt/规格 → strip HTML + 长度截断
+      client.update_product(id, data)
+      client.update_product_seo(id, title, desc)
+      成功 → batch_update(回写状态="已回写", 合规状态="合规", 原始字段同步更新)
+      失败 → batch_update(回写状态="回写失败")
   → 释放锁
 ```
 
@@ -99,3 +130,4 @@ deep_sync(store_id)
 | 前端 404 | 跳过该产品 |
 | 前端超时 | 重试 2 次 |
 | 单条产品异常 | catch，记录，继续下一条 |
+| 回写失败 | 标记"回写失败"，记录日志 |

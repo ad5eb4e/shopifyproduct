@@ -10,15 +10,15 @@
 │                                                                  │
 │  ┌──────────────────── 业务应用层 ─────────────────────────────┐ │
 │  │                                                              │ │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │ │
-│  │  │ sync     │  │compliance│  │writeback │  │ 未来应用    │  │ │
-│  │  │ Shopify→ │  │ 飞书→    │  │ 飞书→    │  │            │  │ │
-│  │  │ 飞书     │  │ 检查→飞书│  │ Shopify  │  │            │  │ │
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │ │
-│  │       │             │             │               │         │ │
-│  │  ─ ─ ─│─ ─ ─ ─ ─ ─ │─ ─ 飞书多维表 ─ ─ ─ ─ ─ ─ ─│─ ─ ─   │ │
-│  │       │             │             │               │         │ │
-│  └───────┼─────────────┼─────────────┼───────────────┼─────────┘ │
+│  │  ┌─────────────────────┐               ┌────────────┐       │ │
+│  │  │ sync（同步+回写）     │               │ 未来应用    │       │ │
+│  │  │ Shopify ↔ 飞书      │               │            │       │ │
+│  │  └──────────┬──────────┘               └─────┬──────┘       │ │
+│  │             │                                │              │ │
+│  │  ─ ─ ─ ─ ─ │─ ─ ─ ─ 飞书多维表 ─ ─ ─ ─ ─ ─ │─ ─ ─ ─ ─    │ │
+│  │             │        （外部合规工具也读写）     │              │ │
+│  │             │                                │              │ │
+│  └─────────────┼────────────────────────────────┼──────────────┘ │
 │          ▼             ▼             ▼               ▼           │
 │  ┌──────────────────── 中台核心层 ──────────────────────────────┐ │
 │  │                                                              │ │
@@ -100,26 +100,18 @@ shopifyproduct/
     __init__.py
     base.py                    # 应用基类 / 接口定义
 
-    sync/                      # 产品同步（Shopify → 飞书）
+    sync/                      # 产品同步 + 回写（Shopify ↔ 飞书）
       __init__.py
-      light_sync.py
-      deep_sync.py
-      models.py
+      light_sync.py            # 轻量扫描
+      deep_sync.py             # 深度扫描
+      writeback.py             # 回写逻辑 + 数据消毒
+      models.py                # 数据结构
       README.md                # 技术文档
       GUIDE.md                 # 运营说明
 
-    compliance/                # 合规检查（飞书 → 检查 → 飞书）
-      __init__.py
-      checker.py
-      rewriter.py
-      README.md                # 技术文档
-      GUIDE.md                 # 运营说明
-
-    writeback/                 # 合规回写（飞书 → Shopify，自动执行）
-      __init__.py
-      writer.py
-      README.md                # 技术文档
-      GUIDE.md                 # 运营说明
+    # 未来应用在此添加，如：
+    # product_copy/            # A站 → B站复制
+    # report_export/           # 多店报表
 
   ── 启动与部署 ──
 
@@ -577,27 +569,26 @@ POST   /api/stores/<id>/writeback  → [writeback] 手动触发回写
 
 | 应用 | 技术文档 | 运营说明 |
 |------|---------|---------|
-| 产品同步 | [apps/sync/README.md](apps/sync/README.md) | [apps/sync/GUIDE.md](apps/sync/GUIDE.md) |
-| 合规检查 | [apps/compliance/README.md](apps/compliance/README.md) | [apps/compliance/GUIDE.md](apps/compliance/GUIDE.md) |
-| 合规回写 | [apps/writeback/README.md](apps/writeback/README.md) | [apps/writeback/GUIDE.md](apps/writeback/GUIDE.md) |
+| 产品同步 + 回写 | [apps/sync/README.md](apps/sync/README.md) | [apps/sync/GUIDE.md](apps/sync/GUIDE.md) |
 
-### 应用依赖关系
+> 合规检查和改写由外部工具完成，不属于本系统。
+
+### 应用与中台的关系
 
 ```
               core.shopify_client    core.lark_client
                      │                      │
-       ┌─────────────┼──────────────────────┼──────────┐
-       │             │                      │          │
-       ▼             ▼                      ▼          ▼
-  ┌─────────┐   ┌─────────┐          ┌───────────┐
-  │  sync   │   │writeback│          │compliance │
-  │ 用 both │   │ 用 both │          │ 只用 lark │
-  └────┬────┘   └────┬────┘          └─────┬─────┘
-       │             │                     │
-       └─────── 飞书多维表（数据总线） ──────┘
-                字段状态驱动协作
-                store 级文件锁保护
-                无代码级依赖
+                     ▼                      ▼
+                ┌─────────────────────────────┐
+                │  sync（同步 + 回写）          │
+                │  ● light_sync → 飞书        │
+                │  ● deep_sync  → 飞书        │
+                │  ● writeback  ← 飞书        │
+                └──────────────┬──────────────┘
+                               │
+                        飞书多维表（数据总线）
+                               │
+                    外部合规工具读写改写字段
 ```
 
 ### 飞书多维表字段规格（31 字段）
@@ -614,19 +605,19 @@ POST   /api/stores/<id>/writeback  → [writeback] 手动触发回写
 | 6 | 前端链接 | 链接 | sync |
 | 7 | 产品图片 | 文本 | sync |
 | 8 | Variant图片 | 文本 | sync |
-| 9/10 | 产品标题 / 改写标题 | 文本 | sync / compliance |
-| 11/12 | 原始描述HTML / 改写描述 | 文本 | sync / compliance |
+| 9/10 | 产品标题 / 改写标题 | 文本 | sync / 外部 |
+| 11/12 | 原始描述HTML / 改写描述 | 文本 | sync / 外部 |
 | 13 | 原始描述纯文本 | 文本 | sync |
-| 14/15 | 产品类型 / 改写产品类型 | 文本 | sync / compliance |
-| 16/17 | 产品标签 / 改写标签 | 文本 | sync / compliance |
-| 18/19 | SEO标题 / 改写SEO标题 | 文本 | sync / compliance |
-| 20/21 | SEO描述 / 改写SEO描述 | 文本 | sync / compliance |
-| 22/23 | Handle / 改写Handle | 文本 | sync / compliance |
-| 24/25 | 图片Alt文本 / 改写图片Alt | 文本 | sync / compliance |
-| 26/27 | 规格名称 / 改写规格名称 | 文本 | sync / compliance |
+| 14/15 | 产品类型 / 改写产品类型 | 文本 | sync / 外部 |
+| 16/17 | 产品标签 / 改写标签 | 文本 | sync / 外部 |
+| 18/19 | SEO标题 / 改写SEO标题 | 文本 | sync / 外部 |
+| 20/21 | SEO描述 / 改写SEO描述 | 文本 | sync / 外部 |
+| 22/23 | Handle / 改写Handle | 文本 | sync / 外部 |
+| 24/25 | 图片Alt文本 / 改写图片Alt | 文本 | sync / 外部 |
+| 26/27 | 规格名称 / 改写规格名称 | 文本 | sync / 外部 |
 | 28 | 所属集合 | 文本 | sync |
-| 29 | 合规状态 | 单选 | sync / compliance / writeback |
-| 30 | 回写状态 | 单选 | writeback |
+| 29 | 合规状态 | 单选 | sync（设待检查）/ 外部（设合规或已改写）/ sync（回写后设合规） |
+| 30 | 回写状态 | 单选 | sync（回写模块） |
 | 31 | 最后更新时间 | 日期时间 | 各应用 |
 
 ---
