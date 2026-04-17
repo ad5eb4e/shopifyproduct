@@ -105,15 +105,21 @@ shopifyproduct/
       light_sync.py
       deep_sync.py
       models.py
+      README.md                # 技术文档
+      GUIDE.md                 # 运营说明
 
     compliance/                # 合规检查（飞书 → 检查 → 飞书）
       __init__.py
-      checker.py               # 9 字段风控检测 + 所属集合告警
+      checker.py
       rewriter.py
+      README.md                # 技术文档
+      GUIDE.md                 # 运营说明
 
     writeback/                 # 合规回写（飞书 → Shopify，自动执行）
       __init__.py
       writer.py
+      README.md                # 技术文档
+      GUIDE.md                 # 运营说明
 
   ── 启动与部署 ──
 
@@ -175,63 +181,7 @@ class BaseApp(ABC):
         return None
 ```
 
-**sync 应用注册示例：**
-
-```python
-class SyncApp(BaseApp):
-    app_name = "sync"
-    description = "产品数据同步（Shopify → 飞书）"
-    config_schema = {
-        "light_cron": "0 3 * * *",
-        "deep_cycle": 3,
-        "deep_hour": 4,
-    }
-
-    def validate_config(self, config):
-        errors = []
-        if not validate_cron(config.get("light_cron", "")):
-            errors.append("light_cron 格式不合法")
-        dc = config.get("deep_cycle")
-        if not isinstance(dc, int) or dc < 1 or dc > 7:
-            errors.append("deep_cycle 必须为 1-7")
-        if not validate_hour(config.get("deep_hour")):
-            errors.append("deep_hour 必须为 0-23")
-        return errors
-
-    def on_config_changed(self, store, old_config, new_config):
-        """配置变更 → 重新注册调度任务（立即生效）"""
-        scheduler.unregister_app_tasks(store.id, self.app_name)
-        tasks = self.get_scheduled_tasks(store, new_config)
-        scheduler.register_app_tasks(store, self.app_name, tasks)
-```
-
-**compliance 应用：**
-
-```python
-class ComplianceApp(BaseApp):
-    app_name = "compliance"
-    description = "合规检查与自动改写（飞书 → 检查 → 飞书）"
-    config_schema = {"check_cron": "0 * * * *"}
-
-    def validate_config(self, config):
-        if not validate_cron(config.get("check_cron", "")):
-            return ["check_cron 格式不合法"]
-        return []
-```
-
-**writeback 应用：**
-
-```python
-class WritebackApp(BaseApp):
-    app_name = "writeback"
-    description = "合规回写（飞书 → Shopify，自动执行）"
-    config_schema = {"writeback_cron": "0 * * * *"}
-
-    def validate_config(self, config):
-        if not validate_cron(config.get("writeback_cron", "")):
-            return ["writeback_cron 格式不合法"]
-        return []
-```
+> 各应用的注册代码见各自的 README.md（[sync](apps/sync/README.md)、[compliance](apps/compliance/README.md)、[writeback](apps/writeback/README.md)）。
 
 ### 4.1 应用发现
 
@@ -623,84 +573,15 @@ POST   /api/stores/<id>/writeback  → [writeback] 手动触发回写
 
 ## 6. 业务应用层
 
-### 6.1 产品同步（`apps/sync/`）
+每个应用的详细技术文档在各自目录的 README.md 中：
 
-**依赖：** `core.shopify_client` + `core.lark_client`
-**不依赖：** compliance / writeback
+| 应用 | 技术文档 | 运营说明 |
+|------|---------|---------|
+| 产品同步 | [apps/sync/README.md](apps/sync/README.md) | [apps/sync/GUIDE.md](apps/sync/GUIDE.md) |
+| 合规检查 | [apps/compliance/README.md](apps/compliance/README.md) | [apps/compliance/GUIDE.md](apps/compliance/GUIDE.md) |
+| 合规回写 | [apps/writeback/README.md](apps/writeback/README.md) | [apps/writeback/GUIDE.md](apps/writeback/GUIDE.md) |
 
-#### 轻量扫描
-
-```
-light_sync(store_id)
-  → 获取 store 级文件锁
-  → client.list_products()
-  → lark.list_records(table_id, filter=store_name)
-  → 对比（基于字段值对比，不用 updated_at）：
-      新产品 → 写入飞书，合规状态="待检查"
-      字段变化 → 更新飞书，合规状态="待检查"，清空所有改写字段
-      已删除 → 产品状态="已删除"
-  → 释放锁
-```
-
-**关键规则：** 重置"待检查"时**必须同时清空所有改写列**（改写标题、改写描述等），防止旧改写数据与新内容不匹配。
-
-#### 深度扫描
-
-```
-deep_sync(store_id)
-  → 获取 store 级文件锁
-  → 从飞书读取所有产品（按 ID 排序）
-  → 从 app_state 读取 deep_offset
-  → batch_size = ceil(total / deep_cycle)
-  → 首次全量，后续分批
-  → 对每个产品：
-      client.get_product_seo(handle) → SEO 变化
-      client.get_product(handle) → 图片 alt / variant 变化
-  → 更新 app_state 中的 deep_offset
-  → 释放锁
-```
-
-### 6.2 合规检查（`apps/compliance/`）
-
-**依赖：** `core.lark_client`
-**不依赖：** shopify_client / sync / writeback
-
-```
-compliance_check(store_id)
-  → 获取 store 级文件锁
-  → lark.query(dsl={合规状态=="待检查" AND 产品状态≠"已删除"})
-  → 对每条记录读取 9 个可扫描字段
-  → 额外检查"所属集合"，命中风险 → 写 sync_logs 告警，不自动改写
-  → 全部合规 → batch_update(合规状态="合规")
-  → 需改写 → rewriter 生成改写内容
-           → batch_update(改写字段 + 合规状态="已改写", 回写状态="未回写")
-  → 释放锁
-```
-
-### 6.3 合规回写（`apps/writeback/`）
-
-**依赖：** `core.shopify_client` + `core.lark_client`
-**不依赖：** sync / compliance
-
-```
-writeback(store_id)
-  → 获取 store 级文件锁
-  → lark.query(dsl={合规状态=="已改写" AND 回写状态≠"已回写" AND 产品状态≠"已删除"})
-  → 对每条记录：
-      validate_product_id()
-      所有改写字段：长度限制 + 格式校验（Handle 须 [a-z0-9-]，标签须逗号分隔等）
-      改写描述 → bleach.clean(ALLOWED_TAGS) — HTML 消毒
-      改写标题/类型/标签/SEO/Handle/Alt/规格 → 纯文本，strip HTML 标签 + 长度截断
-      client.update_product(id, data)
-      client.update_product_seo(id, title, desc)
-      成功 → batch_update(回写状态="已回写", 合规状态="合规", 原始字段同步更新)
-      失败 → batch_update(回写状态="回写失败")
-  → 释放锁
-```
-
-**全自动执行：** compliance 设置 `合规状态="已改写"` 后，writeback 下次运行时自动回写，无需人工干预。如需重新回写（如修改了改写内容），将"回写状态"改回"未回写"即可。
-
-### 6.4 应用依赖关系
+### 应用依赖关系
 
 ```
               core.shopify_client    core.lark_client
@@ -719,39 +600,17 @@ writeback(store_id)
                 无代码级依赖
 ```
 
-### 6.5 数据映射（sync）
+### 飞书多维表字段规格（31 字段）
 
-| API 字段 | 多维表字段 |
-|----------|-----------|
-| `product.id` | Shopify产品ID |
-| `product.title` | 产品标题 |
-| `product.body_html` | 原始描述HTML |
-| html2text(body_html) | 原始描述纯文本 |
-| `product.product_type` | 产品类型 |
-| `product.tags` | 产品标签 |
-| `product.handle` | Handle |
-| `product.status` | 产品状态 |
-| `product.variants[*].price` | 价格（每行：`option1 \| price`） |
-| `product.variants[*].sku` | SKU（每行：`option1 \| sku`） |
-| `product.images[*].src` | 产品图片 |
-| `product.images[*].alt` | 图片Alt文本 |
-| `product.variants[*].featured_image.src` | Variant图片 |
-| `product.variants[*].option1` | 规格名称 |
-| HTML `<title>` | SEO标题 |
-| HTML `<meta description>` | SEO描述 |
-| collects → collection.title | 所属集合 |
-
-### 6.6 飞书多维表字段
-
-> 字段的业务含义见 PRD.md 第 5.2 节。以下为技术实现规格。
+> 字段的业务含义见 [PRD.md 第 4.2 节](PRD.md#42-字段说明)。
 
 | # | 字段名 | 类型 | 写入方 |
 |---|-------|------|-------|
 | 1 | 店铺名称 | 单选 | sync |
 | 2 | Shopify产品ID | 文本 | sync |
-| 3 | 产品状态 | 单选 | sync（含"已删除"） |
-| 4 | 价格 | 文本 | sync（每行：`规格名 \| 价格`） |
-| 5 | SKU | 文本 | sync（每行：`规格名 \| SKU`） |
+| 3 | 产品状态 | 单选 | sync |
+| 4 | 价格 | 文本 | sync |
+| 5 | SKU | 文本 | sync |
 | 6 | 前端链接 | 链接 | sync |
 | 7 | 产品图片 | 文本 | sync |
 | 8 | Variant图片 | 文本 | sync |
@@ -765,29 +624,24 @@ writeback(store_id)
 | 22/23 | Handle / 改写Handle | 文本 | sync / compliance |
 | 24/25 | 图片Alt文本 / 改写图片Alt | 文本 | sync / compliance |
 | 26/27 | 规格名称 / 改写规格名称 | 文本 | sync / compliance |
-| 28 | 所属集合 | 文本 | sync（只读，风险时日志告警） |
+| 28 | 所属集合 | 文本 | sync |
 | 29 | 合规状态 | 单选 | sync / compliance / writeback |
 | 30 | 回写状态 | 单选 | writeback |
 | 31 | 最后更新时间 | 日期时间 | 各应用 |
 
-**回写状态三态：** 未回写 → 已回写 / 回写失败（如需重新回写，改回"未回写"即可）
-
 ---
 
-## 7. 错误处理
+## 7. 错误处理（中台层）
 
-| 场景 | 处理 | 层级 |
-|------|------|------|
-| Shopify 429 | 指数退避（1→2→4s），最多 3 次 | 中台 |
-| Shopify 401（Token） | 标记失效 | 中台 |
-| Shopify 401（OAuth） | 清缓存（per-store 锁）重获，仍 401 标记过期 | 中台 |
-| 代理连接失败 | 标记异常，跳过 | 中台 |
-| lark-cli 失败 | 重试 2 次（2s → 5s） | 中台 |
-| 前端 404 | 跳过该产品 | sync |
-| 前端超时 | 重试 2 次 | sync |
-| 单条产品异常 | catch，记录，继续 | sync |
-| 合规检查异常 | catch，记录，继续 | compliance |
-| 回写失败 | 标记"回写失败" | writeback |
+| 场景 | 处理 |
+|------|------|
+| Shopify 429 | 指数退避（1→2→4s），最多 3 次 |
+| Shopify 401（Token） | 标记失效 |
+| Shopify 401（OAuth） | 清缓存（per-store 锁）重获，仍 401 标记过期 |
+| 代理连接失败 | 标记异常，跳过 |
+| lark-cli 失败 | 重试 2 次（2s → 5s） |
+
+> 应用层的错误处理见各应用的 README.md。
 
 ## 8. 部署
 
